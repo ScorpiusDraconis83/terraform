@@ -6,12 +6,14 @@ package terraform
 import (
 	"testing"
 
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/instances"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/plans/deferring"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
-	"github.com/zclconf/go-cty/cty"
 )
 
 func TestNodeResourcePlanOrphanExecute(t *testing.T) {
@@ -40,7 +42,7 @@ func TestNodeResourcePlanOrphanExecute(t *testing.T) {
 		StateState:               state.SyncWrapper(),
 		RefreshStateState:        state.DeepCopy().SyncWrapper(),
 		PrevRunStateState:        state.DeepCopy().SyncWrapper(),
-		InstanceExpanderExpander: instances.NewExpander(),
+		InstanceExpanderExpander: instances.NewExpander(nil),
 		ProviderProvider:         p,
 		ProviderSchemaSchema: providers.ProviderSchema{
 			ResourceTypes: map[string]providers.Schema{
@@ -50,6 +52,7 @@ func TestNodeResourcePlanOrphanExecute(t *testing.T) {
 			},
 		},
 		ChangesChanges: plans.NewChanges().SyncWrapper(),
+		DeferralsState: deferring.NewDeferred(false),
 	}
 
 	node := NodePlannableResourceInstanceOrphan{
@@ -106,7 +109,7 @@ func TestNodeResourcePlanOrphanExecute_alreadyDeleted(t *testing.T) {
 		StateState:               state.SyncWrapper(),
 		RefreshStateState:        refreshState.SyncWrapper(),
 		PrevRunStateState:        prevRunState.SyncWrapper(),
-		InstanceExpanderExpander: instances.NewExpander(),
+		InstanceExpanderExpander: instances.NewExpander(nil),
 		ProviderProvider:         p,
 		ProviderSchemaSchema: providers.ProviderSchema{
 			ResourceTypes: map[string]providers.Schema{
@@ -116,6 +119,7 @@ func TestNodeResourcePlanOrphanExecute_alreadyDeleted(t *testing.T) {
 			},
 		},
 		ChangesChanges: changes.SyncWrapper(),
+		DeferralsState: deferring.NewDeferred(false),
 	}
 
 	node := NodePlannableResourceInstanceOrphan{
@@ -188,7 +192,7 @@ func TestNodeResourcePlanOrphanExecute_deposed(t *testing.T) {
 		StateState:               state.SyncWrapper(),
 		RefreshStateState:        refreshState.SyncWrapper(),
 		PrevRunStateState:        prevRunState.SyncWrapper(),
-		InstanceExpanderExpander: instances.NewExpander(),
+		InstanceExpanderExpander: instances.NewExpander(nil),
 		ProviderProvider:         p,
 		ProviderSchemaSchema: providers.ProviderSchema{
 			ResourceTypes: map[string]providers.Schema{
@@ -198,6 +202,7 @@ func TestNodeResourcePlanOrphanExecute_deposed(t *testing.T) {
 			},
 		},
 		ChangesChanges: changes.SyncWrapper(),
+		DeferralsState: deferring.NewDeferred(false),
 	}
 
 	node := NodePlannableResourceInstanceOrphan{

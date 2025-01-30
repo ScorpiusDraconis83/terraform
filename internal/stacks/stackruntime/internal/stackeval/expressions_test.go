@@ -7,15 +7,18 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hcldec"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/hashicorp/hcl/v2/hcltest"
 	"github.com/zclconf/go-cty-debug/ctydebug"
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/hcl/v2/hcldec"
-	"github.com/hashicorp/hcl/v2/hcltest"
 	"github.com/hashicorp/terraform/internal/collections"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -78,6 +81,7 @@ func TestEvalExpr(t *testing.T) {
 			hcltest.MockExprTraversalSrc(`stack.multi["bar"]`),
 			hcltest.MockExprTraversalSrc("provider.beep.boop"),
 			hcltest.MockExprTraversalSrc(`provider.beep.boops["baz"]`),
+			hcltest.MockExprTraversalSrc(`terraform.applying`),
 		})
 
 		scope := newStaticExpressionScope()
@@ -95,6 +99,7 @@ func TestEvalExpr(t *testing.T) {
 		scope.AddVal(stackaddrs.ProviderConfigRef{ProviderLocalName: "beep", Name: "boops"}, cty.ObjectVal(map[string]cty.Value{
 			"baz": cty.StringVal("provider config from for_each"),
 		}))
+		scope.AddVal(stackaddrs.TerraformApplying, cty.StringVal("terraform.applying value")) // NOTE: Not a realistic terraform.applying value; just a placeholder to help exercise EvalExpr
 
 		got, diags := EvalExpr(ctx, expr, PlanPhase, scope)
 		if diags.HasErrors() {
@@ -109,11 +114,101 @@ func TestEvalExpr(t *testing.T) {
 			cty.StringVal("stack call from for_each"),
 			cty.StringVal("provider config singleton"),
 			cty.StringVal("provider config from for_each"),
+			cty.StringVal("terraform.applying value"),
 		})
 		if diff := cmp.Diff(want, got, ctydebug.CmpOptions); diff != "" {
 			t.Errorf("wrong result\n%s", diff)
 		}
 	})
+}
+
+func TestReferencesInExpr(t *testing.T) {
+	tests := []struct {
+		exprSrc     string
+		wantTargets []stackaddrs.Referenceable
+	}{
+		{
+			`"hello"`,
+			[]stackaddrs.Referenceable{},
+		},
+		{
+			`var.foo`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.InputVariable{
+					Name: "foo",
+				},
+			},
+		},
+		{
+			`var.foo + var.foo`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.InputVariable{
+					Name: "foo",
+				},
+				stackaddrs.InputVariable{
+					Name: "foo",
+				},
+			},
+		},
+		{
+			`local.bar`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.LocalValue{
+					Name: "bar",
+				},
+			},
+		},
+		{
+			`component.foo["bar"]`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.Component{
+					Name: "foo",
+				},
+			},
+		},
+		{
+			`stack.foo["bar"]`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.StackCall{
+					Name: "foo",
+				},
+			},
+		},
+		{
+			`provider.foo.bar["baz"]`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.ProviderConfigRef{
+					ProviderLocalName: "foo",
+					Name:              "bar",
+				},
+			},
+		},
+		{
+			`terraform.applying`,
+			[]stackaddrs.Referenceable{
+				stackaddrs.TerraformApplying,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.exprSrc, func(t *testing.T) {
+			var diags tfdiags.Diagnostics
+			expr, hclDiags := hclsyntax.ParseExpression([]byte(test.exprSrc), "", hcl.InitialPos)
+			diags = diags.Append(hclDiags)
+			assertNoDiagnostics(t, diags)
+
+			gotRefs := ReferencesInExpr(context.Background(), expr)
+			gotTargets := make([]stackaddrs.Referenceable, len(gotRefs))
+			for i, ref := range gotRefs {
+				gotTargets[i] = ref.Target
+			}
+
+			if diff := cmp.Diff(test.wantTargets, gotTargets); diff != "" {
+				t.Errorf("wrong reference targets\n%s", diff)
+			}
+		})
+	}
 }
 
 func TestEvalBody(t *testing.T) {
@@ -254,6 +349,16 @@ func (s staticExpressionScope) ResolveExpressionReference(ctx context.Context, r
 		return nil, diags
 	}
 	return ret, diags
+}
+
+// ExternalFunctions implements ExpressionScope
+func (s staticExpressionScope) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, tfdiags.Diagnostics) {
+	return lang.ExternalFuncs{}, nil
+}
+
+// PlanTimestamp implements ExpressionScope
+func (s staticExpressionScope) PlanTimestamp() time.Time {
+	return time.Now().UTC()
 }
 
 // Add makes the given object available in the scope at the given address.

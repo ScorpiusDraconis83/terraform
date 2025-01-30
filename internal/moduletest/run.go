@@ -5,6 +5,7 @@ package moduletest
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 
@@ -27,6 +28,33 @@ type Run struct {
 	Status Status
 
 	Diagnostics tfdiags.Diagnostics
+
+	// ExecutionMeta captures metadata about how the test run was executed.
+	//
+	// This field is not always populated. A run that has never been executed
+	// will definitely have a nil value for this field. A run that was
+	// executed may or may not populate this field, depending on exactly what
+	// happened during the run execution. Callers accessing this field MUST
+	// check for nil and handle that case in some reasonable way.
+	//
+	// Executing the same run multiple times may or may not update this field
+	// on each execution.
+	ExecutionMeta *RunExecutionMeta
+}
+
+type RunExecutionMeta struct {
+	Start    time.Time
+	Duration time.Duration
+}
+
+// StartTimestamp returns the start time metadata as a timestamp formatted as YYYY-MM-DDTHH:MM:SSZ.
+// Times are converted to UTC, if they aren't already.
+// If the start time is unset an empty string is returned.
+func (m *RunExecutionMeta) StartTimestamp() string {
+	if m.Start.IsZero() {
+		return ""
+	}
+	return m.Start.UTC().Format(time.RFC3339)
 }
 
 // Verbose is a utility struct that holds all the information required for a run

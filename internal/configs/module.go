@@ -46,8 +46,9 @@ type Module struct {
 
 	ModuleCalls map[string]*ModuleCall
 
-	ManagedResources map[string]*Resource
-	DataResources    map[string]*Resource
+	ManagedResources   map[string]*Resource
+	DataResources      map[string]*Resource
+	EphemeralResources map[string]*Resource
 
 	Moved   []*Moved
 	Removed []*Removed
@@ -86,8 +87,9 @@ type File struct {
 
 	ModuleCalls []*ModuleCall
 
-	ManagedResources []*Resource
-	DataResources    []*Resource
+	ManagedResources   []*Resource
+	DataResources      []*Resource
+	EphemeralResources []*Resource
 
 	Moved   []*Moved
 	Removed []*Removed
@@ -124,6 +126,7 @@ func NewModule(primaryFiles, overrideFiles []*File) (*Module, hcl.Diagnostics) {
 		Outputs:            map[string]*Output{},
 		ModuleCalls:        map[string]*ModuleCall{},
 		ManagedResources:   map[string]*Resource{},
+		EphemeralResources: map[string]*Resource{},
 		DataResources:      map[string]*Resource{},
 		Checks:             map[string]*Check{},
 		ProviderMetas:      map[addrs.Provider]*ProviderMeta{},
@@ -192,6 +195,8 @@ func (m *Module) ResourceByAddr(addr addrs.Resource) *Resource {
 		return m.ManagedResources[key]
 	case addrs.DataResourceMode:
 		return m.DataResources[key]
+	case addrs.EphemeralResourceMode:
+		return m.EphemeralResources[key]
 	default:
 		return nil
 	}
@@ -223,8 +228,8 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 		if m.CloudConfig != nil {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Duplicate Terraform Cloud configurations",
-				Detail:   fmt.Sprintf("A module may have only one 'cloud' block configuring Terraform Cloud. Terraform Cloud was previously configured at %s.", m.CloudConfig.DeclRange),
+				Summary:  "Duplicate HCP Terraform configurations",
+				Detail:   fmt.Sprintf("A module may have only one 'cloud' block configuring HCP Terraform or Terraform Enterprise. The 'cloud' block was previously configured at %s.", m.CloudConfig.DeclRange),
 				Subject:  &c.DeclRange,
 			})
 			continue
@@ -236,8 +241,8 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 	if m.Backend != nil && m.CloudConfig != nil {
 		diags = append(diags, &hcl.Diagnostic{
 			Severity: hcl.DiagError,
-			Summary:  "Both a backend and Terraform Cloud configuration are present",
-			Detail:   fmt.Sprintf("A module may declare either one 'cloud' block configuring Terraform Cloud OR one 'backend' block configuring a state backend. Terraform Cloud is configured at %s; a backend is configured at %s. Remove the backend block to configure Terraform Cloud.", m.CloudConfig.DeclRange, m.Backend.DeclRange),
+			Summary:  "Both a backend and cloud configuration are present",
+			Detail:   fmt.Sprintf("A module may declare either one 'cloud' block OR one 'backend' block configuring a state backend. The 'cloud' block is configured at %s; a backend is configured at %s. Remove the backend block to configure HCP Terraform or Terraform Enteprise.", m.CloudConfig.DeclRange, m.Backend.DeclRange),
 			Subject:  &m.Backend.DeclRange,
 		})
 	}
@@ -372,6 +377,35 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 		m.DataResources[key] = r
 	}
 
+	for _, r := range file.EphemeralResources {
+		key := r.moduleUniqueKey()
+		if existing, exists := m.EphemeralResources[key]; exists {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  fmt.Sprintf("Duplicate ephemeral %q configuration", existing.Type),
+				Detail:   fmt.Sprintf("A %s ephemeral resource named %q was already declared at %s. Resource names must be unique per type in each module.", existing.Type, existing.Name, existing.DeclRange),
+				Subject:  &r.DeclRange,
+			})
+			continue
+		}
+		m.EphemeralResources[key] = r
+
+		// set the provider FQN for the resource
+		if r.ProviderConfigRef != nil {
+			r.Provider = m.ProviderForLocalConfig(r.ProviderConfigAddr())
+		} else {
+			// an invalid resource name (for e.g. "null resource" instead of
+			// "null_resource") can cause a panic down the line in addrs:
+			// https://github.com/hashicorp/terraform/issues/25560
+			implied, err := addrs.ParseProviderPart(r.Addr().ImpliedProvider())
+			if err == nil {
+				r.Provider = m.ImpliedProviderForUnqualifiedType(implied)
+			}
+			// We don't return a diagnostic because the invalid resource name
+			// will already have been caught.
+		}
+	}
+
 	for _, c := range file.Checks {
 		if c.DataResource != nil {
 			key := c.DataResource.moduleUniqueKey()
@@ -498,8 +532,8 @@ func (m *Module) mergeFile(file *File) hcl.Diagnostics {
 			// though it can override cloud/backend blocks from _other_ files.
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Duplicate Terraform Cloud configurations",
-				Detail:   fmt.Sprintf("A module may have only one 'cloud' block configuring Terraform Cloud. Terraform Cloud was previously configured at %s.", file.CloudConfigs[0].DeclRange),
+				Summary:  "Duplicate HCP Terraform configurations",
+				Detail:   fmt.Sprintf("A module may have only one 'cloud' block configuring HCP Terraform or Terraform Enterprise. The 'cloud' block was previously configured at %s.", file.CloudConfigs[0].DeclRange),
 				Subject:  &file.CloudConfigs[1].DeclRange,
 			})
 		}

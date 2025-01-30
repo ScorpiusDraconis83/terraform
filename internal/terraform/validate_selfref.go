@@ -10,7 +10,7 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
-	"github.com/hashicorp/terraform/internal/lang"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -41,7 +41,7 @@ func validateSelfRef(addr addrs.Referenceable, config hcl.Body, providerSchema p
 		return diags
 	}
 
-	refs, _ := lang.ReferencesInBlock(addrs.ParseRef, config, schema)
+	refs, _ := langrefs.ReferencesInBlock(addrs.ParseRef, config, schema)
 	for _, ref := range refs {
 		for _, addrStr := range addrStrs {
 			if ref.Subject.String() == addrStr {
@@ -52,6 +52,75 @@ func validateSelfRef(addr addrs.Referenceable, config hcl.Body, providerSchema p
 					Subject:  ref.SourceRange.ToHCL().Ptr(),
 				})
 			}
+		}
+	}
+
+	return diags
+}
+
+// validateMetaSelfRef checks to ensure that a specific meta expression (count /
+// for_each) does not reference the resource it is attached to. The behaviour
+// is slightly different from validateSelfRef in that this function is only ever
+// called from static contexts (ie. before expansion) and as such the address is
+// always a Resource.
+//
+// This also means that often the references will be to instances of the
+// resource, so we need to unpack these to the containing resource to compare
+// against the static resource. From the perspective of this function
+// `test_resource.foo[4]` is considered to be a self reference to
+// `test_resource.foo`, in which is a significant behaviour change to
+// validateSelfRef.
+func validateMetaSelfRef(addr addrs.Resource, expr hcl.Expression) tfdiags.Diagnostics {
+	return validateSelfRefFromExprInner(addr, expr, func(ref *addrs.Reference) *hcl.Diagnostic {
+		return &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Self-referential block",
+			Detail:   fmt.Sprintf("Configuration for %s may not refer to itself.", addr.String()),
+			Subject:  ref.SourceRange.ToHCL().Ptr(),
+		}
+	})
+}
+
+// validateImportSelfRef is similar to validateMetaSelfRef except it
+// tweaks the error message slightly to reflect the self-reference is coming
+// from an import block instead of directly from the resource. All the same
+// caveats apply as validateMetaSelfRef.
+func validateImportSelfRef(addr addrs.Resource, expr hcl.Expression) tfdiags.Diagnostics {
+	return validateSelfRefFromExprInner(addr, expr, func(ref *addrs.Reference) *hcl.Diagnostic {
+		return &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid import id argument",
+			Detail:   "The import ID cannot reference the resource being imported.",
+			Subject:  ref.SourceRange.ToHCL().Ptr(),
+		}
+	})
+}
+
+// validateSelfRefFromExprInner is a helper function that takes an address and
+// an expression and returns diagnostics for self-references in the expression.
+//
+// This should only be called via validateMetaSelfRef and validateImportSelfRef,
+// do not access this function directly.
+func validateSelfRefFromExprInner(addr addrs.Resource, expr hcl.Expression, diag func(ref *addrs.Reference) *hcl.Diagnostic) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, expr)
+	for _, ref := range refs {
+		var target addrs.Resource
+		switch t := ref.Subject.(type) {
+		case addrs.ResourceInstance:
+			// Automatically unpack an instance reference to its containing
+			// resource, since we're only comparing against the static resource.
+			target = t.Resource
+		case addrs.Resource:
+			target = t
+		default:
+			// Anything else cannot be a self-reference.
+			continue
+		}
+
+		if target.Equal(addr) {
+			diags = diags.Append(diag(ref))
 		}
 	}
 

@@ -19,8 +19,8 @@ import (
 	"time"
 
 	tfe "github.com/hashicorp/go-tfe"
-	"github.com/mitchellh/copystructure"
 
+	"github.com/hashicorp/terraform/internal/copy"
 	tfversion "github.com/hashicorp/terraform/version"
 )
 
@@ -510,6 +510,10 @@ func (m *MockOrganizations) ReadRunQueue(ctx context.Context, name string, optio
 	return rq, nil
 }
 
+func (m *MockOrganizations) ReadDataRetentionPolicyChoice(ctx context.Context, organization string) (*tfe.DataRetentionPolicyChoice, error) {
+	panic("not implemented")
+}
+
 func (m *MockOrganizations) DeleteDataRetentionPolicy(context.Context, string) error {
 	panic("not implemented")
 }
@@ -519,6 +523,14 @@ func (m *MockOrganizations) ReadDataRetentionPolicy(context.Context, string) (*t
 }
 
 func (m *MockOrganizations) SetDataRetentionPolicy(ctx context.Context, organization string, options tfe.DataRetentionPolicySetOptions) (*tfe.DataRetentionPolicy, error) {
+	panic("not implemented")
+}
+
+func (m *MockOrganizations) SetDataRetentionPolicyDeleteOlder(ctx context.Context, organization string, options tfe.DataRetentionPolicyDeleteOlderSetOptions) (*tfe.DataRetentionPolicyDeleteOlder, error) {
+	panic("not implemented")
+}
+
+func (m *MockOrganizations) SetDataRetentionPolicyDontDelete(ctx context.Context, organization string, options tfe.DataRetentionPolicyDontDeleteSetOptions) (*tfe.DataRetentionPolicyDontDelete, error) {
 	panic("not implemented")
 }
 
@@ -1026,11 +1038,8 @@ func (m *MockProjects) List(ctx context.Context, organization string, options *t
 	pl := &tfe.ProjectList{}
 
 	for _, project := range m.projects {
-		pc, err := copystructure.Copy(project)
-		if err != nil {
-			panic(err)
-		}
-		pl.Items = append(pl.Items, pc.(*tfe.Project))
+		pc := copy.DeepCopyValue(project)
+		pl.Items = append(pl.Items, pc)
 	}
 
 	pl.Pagination = &tfe.Pagination{
@@ -1051,12 +1060,8 @@ func (m *MockProjects) Read(ctx context.Context, projectID string) (*tfe.Project
 	}
 
 	// we must return a copy for the client
-	pc, err := copystructure.Copy(p)
-	if err != nil {
-		panic(err)
-	}
-
-	return pc.(*tfe.Project), nil
+	pc := copy.DeepCopyValue(p)
+	return pc, nil
 }
 
 func (m *MockProjects) Update(ctx context.Context, projectID string, options tfe.ProjectUpdateOptions) (*tfe.Project, error) {
@@ -1068,12 +1073,8 @@ func (m *MockProjects) Update(ctx context.Context, projectID string, options tfe
 	p.Name = *options.Name
 
 	// we must return a copy for the client
-	pc, err := copystructure.Copy(p)
-	if err != nil {
-		panic(err)
-	}
-
-	return pc.(*tfe.Project), nil
+	pc := copy.DeepCopyValue(p)
+	return pc, nil
 }
 
 func (m *MockProjects) Delete(ctx context.Context, projectID string) error {
@@ -1184,6 +1185,10 @@ func (m *MockRegistryModules) DeleteVersion(ctx context.Context, moduleID tfe.Re
 	panic("implement me")
 }
 
+func (m *MockRegistryModules) DeleteByName(ctx context.Context, moduleID tfe.RegistryModuleID) error {
+	panic("implement me")
+}
+
 func (m *MockRegistryModules) Update(ctx context.Context, moduleID tfe.RegistryModuleID, options tfe.RegistryModuleUpdateOptions) (*tfe.RegistryModule, error) {
 	//TODO implement me
 	panic("implement me")
@@ -1241,11 +1246,8 @@ func (m *MockRuns) List(ctx context.Context, workspaceID string, options *tfe.Ru
 
 	rl := &tfe.RunList{}
 	for _, run := range m.workspaces[w.ID] {
-		rc, err := copystructure.Copy(run)
-		if err != nil {
-			panic(err)
-		}
-		rl.Items = append(rl.Items, rc.(*tfe.Run))
+		rc := copy.DeepCopyValue(run)
+		rl.Items = append(rl.Items, rc)
 	}
 
 	rl.Pagination = &tfe.Pagination{
@@ -1406,11 +1408,7 @@ func (m *MockRuns) ReadWithOptions(ctx context.Context, runID string, options *t
 	}
 
 	// we must return a copy for the client
-	rc, err := copystructure.Copy(r)
-	if err != nil {
-		panic(err)
-	}
-	r = rc.(*tfe.Run)
+	r = copy.DeepCopyValue(r)
 
 	// After copying, handle includes... or at least, any includes we're known to rely on.
 	if options != nil {
@@ -1944,35 +1942,51 @@ func newMockWorkspaces(client *MockClient) *MockWorkspaces {
 func (m *MockWorkspaces) List(ctx context.Context, organization string, options *tfe.WorkspaceListOptions) (*tfe.WorkspaceList, error) {
 	wl := &tfe.WorkspaceList{}
 	// Get all the workspaces that match the Search value
-	searchValue := ""
 	var ws []*tfe.Workspace
-	var tags []string
+	searchValue := ""
+	searchTags := make(map[string]string)
 
 	if options != nil {
 		if len(options.Search) > 0 {
 			searchValue = options.Search
 		}
 		if len(options.Tags) > 0 {
-			tags = strings.Split(options.Tags, ",")
+			for _, tag := range strings.Split(options.Tags, ",") {
+				searchTags[tag] = ""
+			}
+		}
+		if len(options.TagBindings) > 0 {
+			for _, kvTag := range options.TagBindings {
+				searchTags[kvTag.Key] = kvTag.Value
+			}
 		}
 	}
 
 	for _, w := range m.workspaceIDs {
-		wTags := make(map[string]struct{})
+		wTags := make(map[string]string)
 		for _, wTag := range w.Tags {
-			wTags[wTag.Name] = struct{}{}
+			wTags[wTag.Name] = ""
 		}
 
-		if strings.Contains(w.Name, searchValue) {
-			tagsSatisfied := true
-			for _, tag := range tags {
-				if _, ok := wTags[tag]; !ok {
+		for _, kvTag := range w.TagBindings {
+			wTags[kvTag.Key] = kvTag.Value
+		}
+
+		tagsSatisfied := true
+		for k, v := range searchTags {
+			if value, ok := wTags[k]; ok {
+				if value != v {
 					tagsSatisfied = false
+					break
 				}
+			} else {
+				tagsSatisfied = false
+				break
 			}
-			if tagsSatisfied {
-				ws = append(ws, w)
-			}
+		}
+
+		if strings.Contains(w.Name, searchValue) && tagsSatisfied {
+			ws = append(ws, w)
 		}
 	}
 
@@ -2012,10 +2026,31 @@ func (m *MockWorkspaces) List(ctx context.Context, organization string, options 
 	return wl, nil
 }
 
+func (m *MockWorkspaces) ListTagBindings(ctx context.Context, workspaceID string) ([]*tfe.TagBinding, error) {
+	for _, w := range m.workspaceIDs {
+		if w.ID == workspaceID {
+			return w.TagBindings, nil
+		}
+	}
+
+	return nil, tfe.ErrResourceNotFound
+}
+
+func (m *MockWorkspaces) AddTagBindings(ctx context.Context, workspaceID string, options tfe.WorkspaceAddTagBindingsOptions) ([]*tfe.TagBinding, error) {
+	for id, w := range m.workspaceIDs {
+		if id == workspaceID {
+			w.TagBindings = options.TagBindings
+			return options.TagBindings, nil
+		}
+	}
+
+	return nil, tfe.ErrResourceNotFound
+}
+
 func (m *MockWorkspaces) Create(ctx context.Context, organization string, options tfe.WorkspaceCreateOptions) (*tfe.Workspace, error) {
 	// for TestCloud_setUnavailableTerraformVersion
 	if *options.Name == "unavailable-terraform-version" && options.TerraformVersion != nil {
-		return nil, fmt.Errorf("requested Terraform version not available in this TFC instance")
+		return nil, fmt.Errorf("requested Terraform version not available in this HCP Terraform instance")
 	}
 	if strings.HasSuffix(*options.Name, "no-operations") {
 		options.Operations = tfe.Bool(false)
@@ -2038,6 +2073,7 @@ func (m *MockWorkspaces) Create(ctx context.Context, organization string, option
 		Organization: &tfe.Organization{
 			Name: organization,
 		},
+		TagBindings: options.TagBindings,
 	}
 	if options.Project != nil {
 		w.Project = options.Project
@@ -2137,7 +2173,7 @@ func (m *MockWorkspaces) UpdateByID(ctx context.Context, workspaceID string, opt
 func updateMockWorkspaceAttributes(w *tfe.Workspace, options tfe.WorkspaceUpdateOptions) error {
 	// for TestCloud_setUnavailableTerraformVersion
 	if w.Name == "unavailable-terraform-version" && options.TerraformVersion != nil {
-		return fmt.Errorf("requested Terraform version not available in this TFC instance")
+		return fmt.Errorf("requested Terraform version not available in this HCP Terraform instance")
 	}
 
 	if options.Operations != nil {
@@ -2317,6 +2353,18 @@ func (s *MockWorkspaces) SetDataRetentionPolicy(ctx context.Context, workspaceID
 }
 
 func (s *MockWorkspaces) DeleteDataRetentionPolicy(ctx context.Context, workspaceID string) error {
+	panic("not implemented")
+}
+
+func (s *MockWorkspaces) ReadDataRetentionPolicyChoice(ctx context.Context, workspaceID string) (*tfe.DataRetentionPolicyChoice, error) {
+	panic("not implemented")
+}
+
+func (s *MockWorkspaces) SetDataRetentionPolicyDeleteOlder(ctx context.Context, workspaceID string, options tfe.DataRetentionPolicyDeleteOlderSetOptions) (*tfe.DataRetentionPolicyDeleteOlder, error) {
+	panic("not implemented")
+}
+
+func (s *MockWorkspaces) SetDataRetentionPolicyDontDelete(ctx context.Context, workspaceID string, options tfe.DataRetentionPolicyDontDeleteSetOptions) (*tfe.DataRetentionPolicyDontDelete, error) {
 	panic("not implemented")
 }
 

@@ -11,7 +11,7 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/instances"
-	"github.com/hashicorp/terraform/internal/lang"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -19,20 +19,21 @@ import (
 // evaluateForEachExpression differs from evaluateForEachExpressionValue by
 // returning an error if the count value is not known, and converting the
 // cty.Value to a map[string]cty.Value for compatibility with other calls.
-func evaluateForEachExpression(expr hcl.Expression, ctx EvalContext) (forEach map[string]cty.Value, diags tfdiags.Diagnostics) {
-	return newForEachEvaluator(expr, ctx).ResourceValue()
+func evaluateForEachExpression(expr hcl.Expression, ctx EvalContext, allowUnknown bool) (forEach map[string]cty.Value, known bool, diags tfdiags.Diagnostics) {
+	return newForEachEvaluator(expr, ctx, allowUnknown).ResourceValue()
 }
 
 // forEachEvaluator is the standard mechanism for interpreting an expression
 // given for a "for_each" argument on a resource, module, or import.
-func newForEachEvaluator(expr hcl.Expression, ctx EvalContext) *forEachEvaluator {
+func newForEachEvaluator(expr hcl.Expression, ctx EvalContext, allowUnknown bool) *forEachEvaluator {
 	if ctx == nil {
 		panic("nil EvalContext")
 	}
 
 	return &forEachEvaluator{
-		ctx:  ctx,
-		expr: expr,
+		ctx:          ctx,
+		expr:         expr,
+		allowUnknown: allowUnknown,
 	}
 }
 
@@ -48,70 +49,107 @@ type forEachEvaluator struct {
 	ctx  EvalContext
 	expr hcl.Expression
 
+	// TEMP: If allowUnknown is set then we skip the usual restriction that
+	// unknown values are not allowed in for_each. A caller that sets this
+	// must therefore be ready to deal with the result being unknown.
+	// This will eventually become the default behavior, once we've updated
+	// the rest of this package to handle that situation in a reasonable way.
+	allowUnknown bool
+
 	// internal
 	hclCtx *hcl.EvalContext
 }
 
 // ResourceForEachValue returns a known for_each map[string]cty.Value
 // appropriate for use within resource expansion.
-func (ev *forEachEvaluator) ResourceValue() (map[string]cty.Value, tfdiags.Diagnostics) {
+func (ev *forEachEvaluator) ResourceValue() (map[string]cty.Value, bool, tfdiags.Diagnostics) {
 	res := map[string]cty.Value{}
 
 	// no expression always results in an empty map
 	if ev.expr == nil {
-		return res, nil
+		return res, true, nil
 	}
 
 	forEachVal, diags := ev.Value()
 	if diags.HasErrors() {
-		return res, diags
+		return res, false, diags
 	}
 
 	// ensure our value is known for use in resource expansion
-	diags = diags.Append(ev.ensureKnownForResource(forEachVal))
-	if diags.HasErrors() {
-		return res, diags
+	unknownDiags := ev.ensureKnownForResource(forEachVal)
+	if unknownDiags.HasErrors() {
+		if !ev.allowUnknown {
+			diags = diags.Append(unknownDiags)
+		}
+		return res, false, diags
 	}
 
 	// validate the for_each value for use in resource expansion
 	diags = diags.Append(ev.validateResource(forEachVal))
 	if diags.HasErrors() {
-		return res, diags
+		return res, false, diags
 	}
 
 	if forEachVal.IsNull() || !forEachVal.IsKnown() || markSafeLengthInt(forEachVal) == 0 {
 		// we check length, because an empty set returns a nil map which will panic below
-		return res, diags
+		return res, true, diags
 	}
 
+	if _, marks := forEachVal.Unmark(); len(marks) != 0 {
+		// Should not get here, because validateResource above should have
+		// rejected values that are marked. If we do get here then it's
+		// likely that we've added a new kind of mark that validateResource
+		// doesn't know about yet, and so we'll need to decide how for_each
+		// should react to that new mark.
+		diags = diags.Append(fmt.Errorf("for_each value is marked with %#v despite earlier validation; this is a bug in Terraform", marks))
+		return res, false, diags
+	}
 	res = forEachVal.AsValueMap()
-	return res, diags
+	return res, true, diags
 }
 
 // ImportValue returns the for_each map for use within an import block,
 // enumerated as individual instances.RepetitionData values.
-func (ev *forEachEvaluator) ImportValues() ([]instances.RepetitionData, tfdiags.Diagnostics) {
+func (ev *forEachEvaluator) ImportValues() ([]instances.RepetitionData, bool, tfdiags.Diagnostics) {
 	var res []instances.RepetitionData
 	if ev.expr == nil {
-		return res, nil
+		return res, true, nil
 	}
 
 	forEachVal, diags := ev.Value()
 	if diags.HasErrors() {
-		return res, diags
+		return res, false, diags
 	}
 
 	// ensure our value is known for use in resource expansion
-	diags = diags.Append(ev.ensureKnownForImport(forEachVal))
-	if diags.HasErrors() {
-		return res, diags
+	unknownDiags := diags.Append(ev.ensureKnownForImport(forEachVal))
+	if unknownDiags.HasErrors() {
+		if !ev.allowUnknown {
+			diags = diags.Append(unknownDiags)
+		}
+		return res, false, diags
 	}
 
+	// ensure the value is not ephemeral
+	diags = diags.Append(ev.ensureNotEphemeral(forEachVal))
+
 	if forEachVal.IsNull() {
-		return res, diags
+		return res, true, diags
 	}
 
 	val, marks := forEachVal.Unmark()
+
+	if !val.CanIterateElements() {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity:    hcl.DiagError,
+			Summary:     "Invalid for_each argument",
+			Detail:      "The \"for_each\" expression must be a collection.",
+			Subject:     ev.expr.Range().Ptr(),
+			Expression:  ev.expr,
+			EvalContext: ev.hclCtx,
+		})
+		return res, false, diags
+	}
 
 	it := val.ElementIterator()
 	for it.Next() {
@@ -123,7 +161,7 @@ func (ev *forEachEvaluator) ImportValues() ([]instances.RepetitionData, tfdiags.
 
 	}
 
-	return res, diags
+	return res, true, diags
 }
 
 // Value returns the raw cty.Value evaluated from the given for_each expression
@@ -135,7 +173,7 @@ func (ev *forEachEvaluator) Value() (cty.Value, tfdiags.Diagnostics) {
 		return cty.NullVal(cty.Map(cty.DynamicPseudoType)), nil
 	}
 
-	refs, moreDiags := lang.ReferencesInExpr(addrs.ParseRef, ev.expr)
+	refs, moreDiags := langrefs.ReferencesInExpr(addrs.ParseRef, ev.expr)
 	diags = diags.Append(moreDiags)
 	scope := ev.ctx.EvaluationScope(nil, nil, EvalDataForNoInstanceKey)
 	if scope != nil {
@@ -219,6 +257,27 @@ func (ev *forEachEvaluator) ensureKnownForResource(forEachVal cty.Value) tfdiags
 	return diags
 }
 
+// ensureNotEphemeral makes sure no ephemeral values are used in the for_each expression.
+func (ev *forEachEvaluator) ensureNotEphemeral(forEachVal cty.Value) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+	// Ephemeral values are not allowed because instance keys persist from
+	// plan to apply and between plan/apply rounds, whereas ephemeral values
+	// do not.
+	if forEachVal.HasMark(marks.Ephemeral) {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity:    hcl.DiagError,
+			Summary:     "Invalid for_each argument",
+			Detail:      `The given "for_each" value is derived from an ephemeral value, which means that Terraform cannot persist it between plan/apply rounds. Use only non-ephemeral values to specify a resource's instance keys.`,
+			Subject:     ev.expr.Range().Ptr(),
+			Expression:  ev.expr,
+			EvalContext: ev.hclCtx,
+			Extra:       DiagnosticCausedByEphemeral(true),
+		})
+	}
+
+	return diags
+}
+
 // ValidateResourceValue is used from validation walks to verify the validity
 // of the resource for_Each expression, while still allowing for unknown
 // values.
@@ -236,7 +295,8 @@ func (ev *forEachEvaluator) ValidateResourceValue() tfdiags.Diagnostics {
 func (ev *forEachEvaluator) validateResource(forEachVal cty.Value) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 
-	// give an error diagnostic as this value cannot be used in for_each
+	// Sensitive values are not allowed because otherwise the sensitive keys
+	// would get exposed as part of the instance addresses.
 	if forEachVal.HasMark(marks.Sensitive) {
 		diags = diags.Append(&hcl.Diagnostic{
 			Severity:    hcl.DiagError,
@@ -248,6 +308,8 @@ func (ev *forEachEvaluator) validateResource(forEachVal cty.Value) tfdiags.Diagn
 			Extra:       diagnosticCausedBySensitive(true),
 		})
 	}
+
+	diags = diags.Append(ev.ensureNotEphemeral(forEachVal))
 
 	if diags.HasErrors() {
 		return diags

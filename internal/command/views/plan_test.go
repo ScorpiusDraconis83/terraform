@@ -6,14 +6,16 @@ package views
 import (
 	"testing"
 
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
+	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/terminal"
 	"github.com/hashicorp/terraform/internal/terraform"
-	"github.com/zclconf/go-cty/cty"
 )
 
 // Ensure that the correct view type and in-automation settings propagate to the
@@ -65,14 +67,14 @@ func testPlan(t *testing.T) *plans.Plan {
 		t.Fatal(err)
 	}
 
-	changes := plans.NewChanges()
+	changes := plans.NewChangesSrc()
 	addr := addrs.Resource{
 		Mode: addrs.ManagedResourceMode,
 		Type: "test_resource",
 		Name: "foo",
 	}.Instance(addrs.NoKey).Absolute(addrs.RootModuleInstance)
 
-	changes.SyncWrapper().AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
+	changes.AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
 		Addr:        addr,
 		PrevRunAddr: addr,
 		ProviderAddr: addrs.AbsProviderConfig{
@@ -87,7 +89,9 @@ func testPlan(t *testing.T) *plans.Plan {
 	})
 
 	return &plans.Plan{
-		Changes: changes,
+		Changes:   changes,
+		Applyable: true,
+		Complete:  true,
 	}
 }
 
@@ -113,7 +117,7 @@ func testPlanWithDatasource(t *testing.T) *plans.Plan {
 		t.Fatal(err)
 	}
 
-	plan.Changes.SyncWrapper().AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
+	plan.Changes.AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
 		Addr:        addr,
 		PrevRunAddr: addr,
 		ProviderAddr: addrs.AbsProviderConfig{
@@ -139,8 +143,8 @@ func testSchemas() *terraform.Schemas {
 	}
 }
 
-func testProvider() *terraform.MockProvider {
-	p := new(terraform.MockProvider)
+func testProvider() *testing_provider.MockProvider {
+	p := new(testing_provider.MockProvider)
 	p.ReadResourceFn = func(req providers.ReadResourceRequest) providers.ReadResourceResponse {
 		return providers.ReadResourceResponse{NewState: req.PriorState}
 	}

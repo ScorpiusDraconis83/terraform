@@ -19,8 +19,12 @@ import (
 	tfe "github.com/hashicorp/go-tfe"
 	version "github.com/hashicorp/go-version"
 	svchost "github.com/hashicorp/terraform-svchost"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform-svchost/disco"
 	"github.com/hashicorp/terraform/internal/backend"
+	"github.com/hashicorp/terraform/internal/backend/backendrun"
+	backendLocal "github.com/hashicorp/terraform/internal/backend/local"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/states/remote"
@@ -29,9 +33,6 @@ import (
 	"github.com/hashicorp/terraform/internal/tfdiags"
 	tfversion "github.com/hashicorp/terraform/version"
 	"github.com/mitchellh/colorstring"
-	"github.com/zclconf/go-cty/cty"
-
-	backendLocal "github.com/hashicorp/terraform/internal/backend/local"
 )
 
 const (
@@ -80,7 +81,7 @@ type Remote struct {
 	// local, if non-nil, will be used for all enhanced behavior. This
 	// allows local behavior with the remote backend functioning as remote
 	// state storage backend.
-	local backend.Enhanced
+	local backendrun.OperationsBackend
 
 	// forceLocal, if true, will force the use of the local backend.
 	forceLocal bool
@@ -96,8 +97,8 @@ type Remote struct {
 }
 
 var _ backend.Backend = (*Remote)(nil)
-var _ backend.Enhanced = (*Remote)(nil)
-var _ backend.Local = (*Remote)(nil)
+var _ backendrun.OperationsBackend = (*Remote)(nil)
+var _ backendrun.Local = (*Remote)(nil)
 
 // New creates a new initialized remote backend.
 func New(services *disco.Disco) *Remote {
@@ -106,7 +107,7 @@ func New(services *disco.Disco) *Remote {
 	}
 }
 
-// ConfigSchema implements backend.Enhanced.
+// ConfigSchema implements backend.Backend.
 func (b *Remote) ConfigSchema() *configschema.Block {
 	return &configschema.Block{
 		Attributes: map[string]*configschema.Attribute{
@@ -198,7 +199,7 @@ func (b *Remote) PrepareConfig(obj cty.Value) (cty.Value, tfdiags.Diagnostics) {
 	return obj, diags
 }
 
-func (b *Remote) ServiceDiscoveryAliases() ([]backend.HostAlias, error) {
+func (b *Remote) ServiceDiscoveryAliases() ([]backendrun.HostAlias, error) {
 	aliasHostname, err := svchost.ForComparison(genericHostname)
 	if err != nil {
 		// This should never happen because the hostname is statically defined.
@@ -212,7 +213,7 @@ func (b *Remote) ServiceDiscoveryAliases() ([]backend.HostAlias, error) {
 		return nil, fmt.Errorf("failed to create backend alias to target %q. The hostname is not in the correct format", b.hostname)
 	}
 
-	return []backend.HostAlias{
+	return []backendrun.HostAlias{
 		{
 			From: aliasHostname,
 			To:   targetHostname,
@@ -220,7 +221,7 @@ func (b *Remote) ServiceDiscoveryAliases() ([]backend.HostAlias, error) {
 	}, nil
 }
 
-// Configure implements backend.Enhanced.
+// Configure implements backend.Backend.
 func (b *Remote) Configure(obj cty.Value) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 	if obj.IsNull() {
@@ -544,7 +545,7 @@ func (b *Remote) retryLogHook(attemptNum int, resp *http.Response) {
 	}
 }
 
-// Workspaces implements backend.Enhanced.
+// Workspaces implements backend.Backend.
 func (b *Remote) Workspaces() ([]string, error) {
 	if b.prefix == "" {
 		return nil, backend.ErrWorkspacesNotSupported
@@ -607,7 +608,7 @@ func (b *Remote) WorkspaceNamePattern() string {
 	return ""
 }
 
-// DeleteWorkspace implements backend.Enhanced.
+// DeleteWorkspace implements backend.Backend.
 func (b *Remote) DeleteWorkspace(name string, _ bool) error {
 	if b.workspace == "" && name == backend.DefaultStateName {
 		return backend.ErrDefaultWorkspaceNotSupported
@@ -635,7 +636,7 @@ func (b *Remote) DeleteWorkspace(name string, _ bool) error {
 	return client.Delete()
 }
 
-// StateMgr implements backend.Enhanced.
+// StateMgr implements backend.Backend.
 func (b *Remote) StateMgr(name string) (statemgr.Full, error) {
 	if b.workspace == "" && name == backend.DefaultStateName {
 		return nil, backend.ErrDefaultWorkspaceNotSupported
@@ -700,7 +701,7 @@ func (b *Remote) StateMgr(name string) (statemgr.Full, error) {
 	return &remote.State{
 		Client: client,
 
-		// client.runID will be set if we're running a the Terraform Cloud
+		// client.runID will be set if we're running in a HCP Terraform
 		// or Terraform Enterprise remote execution environment, in which
 		// case we'll disable intermediate snapshots to avoid extra storage
 		// costs for Terraform Enterprise customers.
@@ -743,8 +744,8 @@ func (b *Remote) fetchWorkspace(ctx context.Context, organization string, name s
 	return w, nil
 }
 
-// Operation implements backend.Enhanced.
-func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend.RunningOperation, error) {
+// Operation implements backendrun.OperationsBackend.
+func (b *Remote) Operation(ctx context.Context, op *backendrun.Operation) (*backendrun.RunningOperation, error) {
 	w, err := b.fetchWorkspace(ctx, b.organization, op.Workspace)
 
 	if err != nil {
@@ -758,7 +759,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 	// - Workspace configured for local operations, in which case the remote
 	//   version is meaningless;
 	// - Forcing local operations with a remote backend, which should only
-	//   happen in the Terraform Cloud worker, in which case the Terraform
+	//   happen in the HCP Terraform worker, in which case the Terraform
 	//   versions by definition match.
 	b.IgnoreVersionConflict()
 
@@ -775,13 +776,13 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 	op.Workspace = w.Name
 
 	// Determine the function to call for our operation
-	var f func(context.Context, context.Context, *backend.Operation, *tfe.Workspace) (*tfe.Run, error)
+	var f func(context.Context, context.Context, *backendrun.Operation, *tfe.Workspace) (*tfe.Run, error)
 	switch op.Type {
-	case backend.OperationTypePlan:
+	case backendrun.OperationTypePlan:
 		f = b.opPlan
-	case backend.OperationTypeApply:
+	case backendrun.OperationTypeApply:
 		f = b.opApply
-	case backend.OperationTypeRefresh:
+	case backendrun.OperationTypeRefresh:
 		return nil, fmt.Errorf(
 			"\n\nThe \"refresh\" operation is not supported when using the \"remote\" backend. " +
 				"Use \"terraform apply -refresh-only\" instead.")
@@ -796,7 +797,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 	// Build our running operation
 	// the runninCtx is only used to block until the operation returns.
 	runningCtx, done := context.WithCancel(context.Background())
-	runningOp := &backend.RunningOperation{
+	runningOp := &backendrun.RunningOperation{
 		Context:   runningCtx,
 		PlanEmpty: true,
 	}
@@ -828,7 +829,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 		}
 
 		if r == nil && opErr == context.Canceled {
-			runningOp.Result = backend.OperationFailure
+			runningOp.Result = backendrun.OperationFailure
 			return
 		}
 
@@ -855,7 +856,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 			}
 
 			if r.Status == tfe.RunCanceled || r.Status == tfe.RunErrored {
-				runningOp.Result = backend.OperationFailure
+				runningOp.Result = backendrun.OperationFailure
 			}
 		}
 	}()
@@ -864,7 +865,7 @@ func (b *Remote) Operation(ctx context.Context, op *backend.Operation) (*backend
 	return runningOp, nil
 }
 
-func (b *Remote) cancel(cancelCtx context.Context, op *backend.Operation, r *tfe.Run) error {
+func (b *Remote) cancel(cancelCtx context.Context, op *backendrun.Operation, r *tfe.Run) error {
 	if r.Actions.IsCancelable {
 		// Only ask if the remote operation should be canceled
 		// if the auto approve flag is not set.

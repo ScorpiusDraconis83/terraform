@@ -6,8 +6,6 @@ package terraform
 import (
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/hcl/v2"
@@ -22,6 +20,8 @@ import (
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/namedvals"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/plans/deferring"
+	"github.com/hashicorp/terraform/internal/resources/ephemeral"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -39,9 +39,26 @@ type Evaluator struct {
 	// Config is the root node in the configuration tree.
 	Config *configs.Config
 
+	// Instances tracks the dynamic instances that are associated with each
+	// module call or resource. The graph walk gradually registers the
+	// set of instances for each object within the graph nodes for those
+	// objects, and so as long as the graph has been built correctly the
+	// set of instances for an object should always be available by the time
+	// we're evaluating expressions that refer to it.
+	Instances *instances.Expander
+
 	// NamedValues is where we keep the values of already-evaluated input
 	// variables, local values, and output values.
 	NamedValues *namedvals.State
+
+	// EphemeralResources tracks the currently-open instances of any ephemeral
+	// resources.
+	EphemeralResources *ephemeral.Resources
+
+	// Deferrals tracks resources and modules that have had either their
+	// expansion or their specific planned actions deferred to a future
+	// plan/apply round.
+	Deferrals *deferring.Deferred
 
 	// Plugins is the library of available plugin components (providers and
 	// provisioners) that we have available to help us evaluate expressions
@@ -84,7 +101,7 @@ func (e *Evaluator) Scope(data lang.Data, self addrs.Referenceable, source addrs
 // evaluationStateData is an implementation of lang.Data that resolves
 // references primarily (but not exclusively) using information from a State.
 type evaluationStateData struct {
-	Evaluator *Evaluator
+	*evaluationData
 
 	// ModulePath is the path through the dynamic module tree to the module
 	// that references will be resolved relative to.
@@ -137,6 +154,13 @@ var EvalDataForNoInstanceKey = InstanceKeyEvalData{}
 
 // evaluationStateData must implement lang.Data
 var _ lang.Data = (*evaluationStateData)(nil)
+
+// StaticValidateReferences calls [Evaluator.StaticValidateReferences] on
+// the evaluator embedded in this data object, using this data object's
+// static module path.
+func (d *evaluationStateData) StaticValidateReferences(refs []*addrs.Reference, self addrs.Referenceable, source addrs.Referenceable) tfdiags.Diagnostics {
+	return d.Evaluator.StaticValidateReferences(refs, d.ModulePath.Module(), self, source)
+}
 
 func (d *evaluationStateData) GetCountAttr(addr addrs.CountAttr, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
@@ -212,7 +236,7 @@ func (d *evaluationStateData) GetInputVariable(addr addrs.InputVariable, rng tfd
 
 	// First we'll make sure the requested value is declared in configuration,
 	// so we can produce a nice message if not.
-	moduleConfig := d.Evaluator.Config.DescendentForInstance(d.ModulePath)
+	moduleConfig := d.Evaluator.Config.DescendantForInstance(d.ModulePath)
 	if moduleConfig == nil {
 		// should never happen, since we can't be evaluating in a module
 		// that wasn't mentioned in configuration.
@@ -255,18 +279,26 @@ func (d *evaluationStateData) GetInputVariable(addr addrs.InputVariable, rng tfd
 	// being liberal in what it accepts because the subsequent plan walk has
 	// more information available and so can be more conservative.
 	if d.Operation == walkValidate {
-		// Ensure variable sensitivity is captured in the validate walk
+		// We should still capture the statically-configured marks during
+		// the validate walk.
+		ret := cty.UnknownVal(config.Type)
 		if config.Sensitive {
-			return cty.UnknownVal(config.Type).Mark(marks.Sensitive), diags
+			ret = ret.Mark(marks.Sensitive)
 		}
-		return cty.UnknownVal(config.Type), diags
+		if config.Ephemeral {
+			ret = ret.Mark(marks.Ephemeral)
+		}
+		return ret, diags
 	}
 
 	val := d.Evaluator.NamedValues.GetInputVariableValue(d.ModulePath.InputVariable(addr.Name))
 
-	// Mark if sensitive
+	// Mark if sensitive and/or ephemeral
 	if config.Sensitive {
 		val = val.Mark(marks.Sensitive)
+	}
+	if config.Ephemeral {
+		val = val.Mark(marks.Ephemeral)
 	}
 
 	return val, diags
@@ -277,7 +309,7 @@ func (d *evaluationStateData) GetLocalValue(addr addrs.LocalValue, rng tfdiags.S
 
 	// First we'll make sure the requested value is declared in configuration,
 	// so we can produce a nice message if not.
-	moduleConfig := d.Evaluator.Config.DescendentForInstance(d.ModulePath)
+	moduleConfig := d.Evaluator.Config.DescendantForInstance(d.ModulePath)
 	if moduleConfig == nil {
 		// should never happen, since we can't be evaluating in a module
 		// that wasn't mentioned in configuration.
@@ -314,8 +346,9 @@ func (d *evaluationStateData) GetModule(addr addrs.ModuleCall, rng tfdiags.Sourc
 	// Output results live in the module that declares them, which is one of
 	// the child module instances of our current module path.
 	moduleAddr := d.ModulePath.Module().Child(addr.Name)
+	absAddr := addr.Absolute(d.ModulePath)
 
-	parentCfg := d.Evaluator.Config.DescendentForInstance(d.ModulePath)
+	parentCfg := d.Evaluator.Config.DescendantForInstance(d.ModulePath)
 	callConfig, ok := parentCfg.Module.ModuleCalls[addr.Name]
 	if !ok {
 		diags = diags.Append(&hcl.Diagnostic{
@@ -330,7 +363,7 @@ func (d *evaluationStateData) GetModule(addr addrs.ModuleCall, rng tfdiags.Sourc
 	// We'll consult the configuration to see what output names we are
 	// expecting, so we can ensure the resulting object is of the expected
 	// type even if our data is incomplete for some reason.
-	moduleConfig := d.Evaluator.Config.Descendent(moduleAddr)
+	moduleConfig := d.Evaluator.Config.Descendant(moduleAddr)
 	if moduleConfig == nil {
 		// should never happen, since we have a valid module call above, this
 		// should be caught during static validation.
@@ -338,259 +371,123 @@ func (d *evaluationStateData) GetModule(addr addrs.ModuleCall, rng tfdiags.Sourc
 	}
 	outputConfigs := moduleConfig.Module.Outputs
 
-	// Collect all the relevant outputs that current exist in the state.
-	// We know the instance path up to this point, and the child module name,
-	// so we only need to store these by instance key.
-	stateMap := map[addrs.InstanceKey]map[string]cty.Value{}
-	for _, elem := range d.Evaluator.NamedValues.GetOutputValuesForModuleCall(d.ModulePath, addr).Elems {
-		outputAddr := elem.Key
-		val := elem.Value
-
-		_, callInstance := outputAddr.Module.CallInstance()
-		instance, ok := stateMap[callInstance.Key]
-		if !ok {
-			instance = map[string]cty.Value{}
-			stateMap[callInstance.Key] = instance
-		}
-
-		instance[outputAddr.OutputValue.Name] = val
-	}
-
-	// Get all changes that reside for this module call within our path.
-	// The change contains the full addr, so we can key these with strings.
-	changesMap := map[addrs.InstanceKey]map[string]*plans.OutputChangeSrc{}
-	for _, change := range d.Evaluator.Changes.GetOutputChanges(d.ModulePath, addr) {
-		_, callInstance := change.Addr.Module.CallInstance()
-		instance, ok := changesMap[callInstance.Key]
-		if !ok {
-			instance = map[string]*plans.OutputChangeSrc{}
-			changesMap[callInstance.Key] = instance
-		}
-
-		instance[change.Addr.OutputValue.Name] = change
-	}
-
-	// Build up all the module objects, creating a map of values for each
-	// module instance.
-	moduleInstances := map[addrs.InstanceKey]map[string]cty.Value{}
-
-	// create a dummy object type for validation below
-	unknownMap := map[string]cty.Type{}
-
-	// the structure is based on the configuration, so iterate through all the
-	// defined outputs, and add any instance state or changes we find.
-	for _, cfg := range outputConfigs {
-		// record the output names for validation
-		unknownMap[cfg.Name] = cty.DynamicPseudoType
-
-		// get all instance output for this path from the state
-		for key, states := range stateMap {
-			outputState, ok := states[cfg.Name]
-			if !ok {
-				continue
-			}
-
-			instance, ok := moduleInstances[key]
-			if !ok {
-				instance = map[string]cty.Value{}
-				moduleInstances[key] = instance
-			}
-
-			instance[cfg.Name] = outputState
-		}
-
-		// any pending changes override the state state values
-		for key, changes := range changesMap {
-			changeSrc, ok := changes[cfg.Name]
-			if !ok {
-				continue
-			}
-
-			instance, ok := moduleInstances[key]
-			if !ok {
-				instance = map[string]cty.Value{}
-				moduleInstances[key] = instance
-			}
-
-			change, err := changeSrc.Decode()
-			if err != nil {
-				// This should happen only if someone has tampered with a plan
-				// file, so we won't bother with a pretty error for it.
-				diags = diags.Append(fmt.Errorf("planned change for %s could not be decoded: %s", addr, err))
-				instance[cfg.Name] = cty.DynamicVal
-				continue
-			}
-
-			instance[cfg.Name] = change.After
-
-			if change.Sensitive {
-				instance[cfg.Name] = change.After.Mark(marks.Sensitive)
-			}
-		}
-	}
-
-	var ret cty.Value
-
-	// compile the outputs into the correct value type for the each mode
-	switch {
-	case callConfig.Count != nil:
-		// figure out what the last index we have is
-		length := -1
-		for key := range moduleInstances {
-			intKey, ok := key.(addrs.IntKey)
-			if !ok {
-				// old key from state which is being dropped
-				continue
-			}
-			if int(intKey) >= length {
-				length = int(intKey) + 1
-			}
-		}
-
-		if length > 0 {
-			vals := make([]cty.Value, length)
-			for key, instance := range moduleInstances {
-				intKey, ok := key.(addrs.IntKey)
-				if !ok {
-					// old key from state which is being dropped
-					continue
-				}
-
-				vals[int(intKey)] = cty.ObjectVal(instance)
-			}
-
-			// Insert unknown values where there are any missing instances
-			for i, v := range vals {
-				if v.IsNull() {
-					vals[i] = cty.DynamicVal
-					continue
-				}
-			}
-			ret = cty.TupleVal(vals)
-		} else {
-			ret = cty.EmptyTupleVal
-		}
-
-	case callConfig.ForEach != nil:
-		vals := make(map[string]cty.Value)
-		for key, instance := range moduleInstances {
-			strKey, ok := key.(addrs.StringKey)
-			if !ok {
-				continue
-			}
-
-			vals[string(strKey)] = cty.ObjectVal(instance)
-		}
-
-		if len(vals) > 0 {
-			ret = cty.ObjectVal(vals)
-		} else {
-			ret = cty.EmptyObjectVal
-		}
-
-	default:
-		val, ok := moduleInstances[addrs.NoKey]
-		if !ok {
-			// create the object if there wasn't one known
-			val = map[string]cty.Value{}
-			for k := range outputConfigs {
-				val[k] = cty.DynamicVal
-			}
-		}
-
-		ret = cty.ObjectVal(val)
-	}
-
-	// The module won't be expanded during validation, so we need to return an
-	// unknown value. This will ensure the types looks correct, since we built
-	// the objects based on the configuration.
+	// We don't do instance expansion during validation, and so we need to
+	// return an unknown value. Technically we should always return
+	// cty.DynamicVal here because the final value during plan will always
+	// be an object or tuple type with unpredictable attributes/elements,
+	// but because we never actually carry values forward from validation to
+	// planning we lie a little here and return unknown list and map types,
+	// just to give us more opportunities to catch author mistakes during
+	// validation.
+	//
+	// This means that in practice any expression that refers to a module
+	// call must be written to be valid for either a collection type or
+	// structural type of similar kind, so that it can be considered as
+	// valid during both the validate and plan walks.
 	if d.Operation == walkValidate {
-		// While we know the type here and it would be nice to validate whether
-		// indexes are valid or not, because tuples and objects have fixed
-		// numbers of elements we can't simply return an unknown value of the
-		// same type since we have not expanded any instances during
-		// validation.
-		//
-		// In order to validate the expression a little precisely, we'll create
-		// an unknown map or list here to get more type information.
-		ty := cty.Object(unknownMap)
+		atys := make(map[string]cty.Type, len(outputConfigs))
+		for name := range outputConfigs {
+			atys[name] = cty.DynamicPseudoType // output values are dynamically-typed
+		}
+		instTy := cty.Object(atys)
+
 		switch {
 		case callConfig.Count != nil:
-			ret = cty.UnknownVal(cty.List(ty))
+			return cty.UnknownVal(cty.List(instTy)), diags
 		case callConfig.ForEach != nil:
-			ret = cty.UnknownVal(cty.Map(ty))
+			return cty.UnknownVal(cty.Map(instTy)), diags
 		default:
-			ret = cty.UnknownVal(ty)
+			return cty.UnknownVal(instTy), diags
 		}
 	}
 
-	return ret, diags
-}
+	// For all other walk types, we proceed to dynamic evaluation of individual
+	// instances, using the global instance expander. An earlier graph node
+	// should always have registered the expansion of this module call before
+	// we get here, unless there's a bug in the graph builders.
+	allInstances := d.Evaluator.Instances
+	instKeyType, instKeys, known := allInstances.ExpandAbsModuleCall(absAddr)
+	if !known {
+		// If we don't know which instances exist then we can't really predict
+		// anything at all. We can't even predict the return type based on
+		// instKeyType because output values are dynamically-typed and so
+		// our final result will always be an object or tuple type whose
+		// attribute/element count we cannot predict.
+		return cty.DynamicVal, diags
+	}
 
-func (d *evaluationStateData) GetPathAttr(addr addrs.PathAttr, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-	switch addr.Name {
+	instanceObjVal := func(instKey addrs.InstanceKey) (cty.Value, tfdiags.Diagnostics) {
+		// This function must always return a valid value, even if it's
+		// just a cty.DynamicVal placeholder accompanying error diagnostics.
+		var diags tfdiags.Diagnostics
 
-	case "cwd":
-		var err error
-		var wd string
-		if d.Evaluator.Meta != nil {
-			// Meta is always non-nil in the normal case, but some test cases
-			// are not so realistic.
-			wd = d.Evaluator.Meta.OriginalWorkingDir
-		}
-		if wd == "" {
-			wd, err = os.Getwd()
-			if err != nil {
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  `Failed to get working directory`,
-					Detail:   fmt.Sprintf(`The value for path.cwd cannot be determined due to a system error: %s`, err),
-					Subject:  rng.ToHCL().Ptr(),
-				})
-				return cty.DynamicVal, diags
+		namedVals := d.Evaluator.NamedValues
+		moduleInstAddr := absAddr.Instance(instKey)
+		attrs := make(map[string]cty.Value, len(outputConfigs))
+		for name := range outputConfigs {
+			outputAddr := moduleInstAddr.OutputValue(name)
+
+			// Although we do typically expect the graph dependencies to
+			// ensure that values get registered before they are needed,
+			// we track depedencies with specific output values where
+			// possible, instead of with entire module calls, and so
+			// in this specific case it's valid for some of this call's
+			// output values to not be known yet, with the graph builder
+			// being responsible for making sure that no expression
+			// in the configuration can actually observe that.
+			if !namedVals.HasOutputValue(outputAddr) {
+				attrs[name] = cty.DynamicVal
+				continue
 			}
-		}
-		// The current working directory should always be absolute, whether we
-		// just looked it up or whether we were relying on ContextMeta's
-		// (possibly non-normalized) path.
-		wd, err = filepath.Abs(wd)
-		if err != nil {
-			diags = diags.Append(&hcl.Diagnostic{
-				Severity: hcl.DiagError,
-				Summary:  `Failed to get working directory`,
-				Detail:   fmt.Sprintf(`The value for path.cwd cannot be determined due to a system error: %s`, err),
-				Subject:  rng.ToHCL().Ptr(),
-			})
-			return cty.DynamicVal, diags
+			outputVal := namedVals.GetOutputValue(outputAddr)
+			attrs[name] = outputVal
 		}
 
-		return cty.StringVal(filepath.ToSlash(wd)), diags
+		return cty.ObjectVal(attrs), diags
+	}
 
-	case "module":
-		moduleConfig := d.Evaluator.Config.DescendentForInstance(d.ModulePath)
-		if moduleConfig == nil {
-			// should never happen, since we can't be evaluating in a module
-			// that wasn't mentioned in configuration.
-			panic(fmt.Sprintf("module.path read from module %s, which has no configuration", d.ModulePath))
+	switch instKeyType {
+
+	case addrs.NoKeyType:
+		// In this case we should always have exactly one instance that
+		// is addrs.NoKey. If not then there's a bug in the [instances.Expander]
+		// implementation.
+		if len(instKeys) != 1 {
+			panic(fmt.Sprintf("module call has no instance key type but has %d instances (should be 1)", len(instKeys)))
 		}
-		sourceDir := moduleConfig.Module.SourceDir
-		return cty.StringVal(filepath.ToSlash(sourceDir)), diags
+		ret, moreDiags := instanceObjVal(instKeys[0])
+		diags = diags.Append(moreDiags)
+		return ret, diags
 
-	case "root":
-		sourceDir := d.Evaluator.Config.Module.SourceDir
-		return cty.StringVal(filepath.ToSlash(sourceDir)), diags
+	case addrs.IntKeyType:
+		// We can assume that the instance keys are in ascending numerical order
+		// and are consecutive, per the contract of allInstances.ExpandModuleCall.
+		elems := make([]cty.Value, 0, len(instKeys))
+		for _, instKey := range instKeys {
+			instVal, moreDiags := instanceObjVal(instKey)
+			elems = append(elems, instVal)
+			diags = diags.Append(moreDiags)
+		}
+		return cty.TupleVal(elems), diags
+
+	case addrs.StringKeyType:
+		attrs := make(map[string]cty.Value, len(instKeys))
+		for _, instKey := range instKeys {
+			instVal, moreDiags := instanceObjVal(instKey)
+			attrs[string(instKey.(addrs.StringKey))] = instVal
+			diags = diags.Append(moreDiags)
+		}
+		return cty.ObjectVal(attrs), diags
 
 	default:
-		suggestion := didyoumean.NameSuggestion(addr.Name, []string{"cwd", "module", "root"})
-		if suggestion != "" {
-			suggestion = fmt.Sprintf(" Did you mean %q?", suggestion)
-		}
 		diags = diags.Append(&hcl.Diagnostic{
 			Severity: hcl.DiagError,
-			Summary:  `Invalid "path" attribute`,
-			Detail:   fmt.Sprintf(`The "path" object does not have an attribute named %q.%s`, addr.Name, suggestion),
-			Subject:  rng.ToHCL().Ptr(),
+			Summary:  `Unsupported instance key type`,
+			Detail: fmt.Sprintf(
+				`Module call %s has instance key type %#v, which is not supported by the expression evaluator. This is a bug in Terraform.`,
+				absAddr, instKeyType,
+			),
+			Subject: rng.ToHCL().Ptr(),
 		})
 		return cty.DynamicVal, diags
 	}
@@ -601,7 +498,7 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 	// First we'll consult the configuration to see if an resource of this
 	// name is declared at all.
 	moduleAddr := d.ModulePath
-	moduleConfig := d.Evaluator.Config.DescendentForInstance(moduleAddr)
+	moduleConfig := d.Evaluator.Config.DescendantForInstance(moduleAddr)
 	if moduleConfig == nil {
 		// should never happen, since we can't be evaluating in a module
 		// that wasn't mentioned in configuration.
@@ -617,6 +514,41 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 			Subject:  rng.ToHCL().Ptr(),
 		})
 		return cty.DynamicVal, diags
+	}
+
+	// Much of this function was written before we had factored out the handling
+	// of instance keys into the separate instance expander model, and so it
+	// does a bunch of instance-related work itself below.
+	//
+	// Currently, unknown instance keys are only possible when planning with
+	// DeferralAllowed set to true in the PlanOpts, which should only be the
+	// case in the stacks runtime (not the "normal terraform" modules runtime).
+	// Thus, we have some amount of duplicated code remaining, to be more
+	// certain that stacks-specific behaviors won't leak out into the standard
+	// runtime.
+	//
+	// TODO: When deferred actions are more stable and robust in stacks, it
+	// would be nice to rework this function to rely on the ResourceInstanceKeys
+	// result for _all_ of its work, rather than continuing to duplicate a bunch
+	// of the logic we've tried to encapsulate over ther already.
+	if d.Operation == walkPlan || d.Operation == walkApply {
+		if _, _, hasUnknownKeys := d.Evaluator.Instances.ResourceInstanceKeys(addr.Absolute(moduleAddr)); hasUnknownKeys {
+			// There really isn't anything interesting we can do in this situation,
+			// because it means we have an unknown for_each/count, in which case
+			// we can't even predict what the result type will be because it
+			// would be either an object or tuple type decided based on the instance
+			// keys.
+			// (We can't get in here for a single-instance resource because in that
+			// case we would know that there's only one key and it's addrs.NoKey,
+			// so we'll fall through to the other logic below.)
+			unknownVal := cty.DynamicVal
+
+			// If an ephemeral resource is deferred we need to mark the returned unknown value as ephemeral
+			if addr.Mode == addrs.EphemeralResourceMode {
+				unknownVal = unknownVal.Mark(marks.Ephemeral)
+			}
+			return unknownVal, diags
+		}
 	}
 
 	// Build the provider address from configuration, since we may not have
@@ -636,6 +568,17 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 		return cty.DynamicVal, diags
 	}
 	ty := schema.ImpliedType()
+
+	if addr.Mode == addrs.EphemeralResourceMode {
+		// FIXME: This does not yet work with deferrals, and it would be nice to
+		// find some way to refactor this so that the following code is not so
+		// tethered to the current implementation details. Instead we should
+		// have an abstract idea of first determining what instances the
+		// resource has (using d.Evaluator.Instances.ResourceInstanceKeys) and
+		// then retrieving the value for each instance to assemble into the
+		// result, using some per-resource-mode logic maintained elsewhere.
+		return d.getEphemeralResource(addr, rng)
+	}
 
 	rs := d.Evaluator.State.Resource(addr.Absolute(d.ModulePath))
 
@@ -686,17 +629,34 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 			}
 
 		default:
-			// We should only end up here during the validate walk,
-			// since later walks should have at least partial states populated
-			// for all resources in the configuration.
+			// We should only end up here during the validate walk (or
+			// console/eval), since later walks should have at least partial
+			// states populated for all resources in the configuration.
 			return cty.DynamicVal, diags
 		}
 	}
 
-	// Decode all instances in the current state
+	// Now, we're going to build up a value that represents the resource
+	// or resources that are in the state.
 	instances := map[addrs.InstanceKey]cty.Value{}
+
+	// First, we're going to load any instances that we have written into the
+	// deferrals system. A deferred resource overrides anything that might be
+	// in the state for the resource, so we do this first.
+	for key, value := range d.Evaluator.Deferrals.GetDeferredResourceInstances(addr.Absolute(d.ModulePath)) {
+		instances[key] = value
+	}
+
+	// Decode all instances in the current state
 	pendingDestroy := d.Operation == walkDestroy
 	for key, is := range rs.Instances {
+		if _, ok := instances[key]; ok {
+			// Then we've already loaded this instance from the deferrals so
+			// we'll just ignore it being in state.
+			continue
+		}
+		// Otherwise, we'll load the instance from state.
+
 		if is == nil || is.Current == nil {
 			// Assume we're dealing with an instance that hasn't been created yet.
 			instances[key] = cty.UnknownVal(ty)
@@ -704,7 +664,6 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 		}
 
 		instAddr := addr.Instance(key).Absolute(d.ModulePath)
-
 		change := d.Evaluator.Changes.GetResourceInstanceChange(instAddr, addrs.NotDeposed)
 		if change != nil {
 			// Don't take any resources that are yet to be deleted into account.
@@ -722,35 +681,17 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 		// and need to be replaced by the planned value here.
 		if is.Current.Status == states.ObjectPlanned {
 			if change == nil {
-				// If the object is in planned status then we should not get
-				// here, since we should have found a pending value in the plan
-				// above instead.
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Missing pending object in plan",
-					Detail:   fmt.Sprintf("Instance %s is marked as having a change pending but that change is not recorded in the plan. This is a bug in Terraform; please report it.", instAddr),
-					Subject:  &config.DeclRange,
-				})
+				// FIXME: This is usually an unfortunate case where we need to
+				// lookup an individual instance referenced via "self" for
+				// postconditions which we know exists, but because evaluation
+				// must always get the resource in aggregate some instance
+				// changes may not yet be registered.
+				instances[key] = cty.DynamicVal
+				// log the problem for debugging, since it may be a legitimate error we can't catch
+				log.Printf("[WARN] instance %s is marked as having a change pending but that change is not recorded in the plan", instAddr)
 				continue
 			}
-			val, err := change.After.Decode(ty)
-			if err != nil {
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Invalid resource instance data in plan",
-					Detail:   fmt.Sprintf("Instance %s data could not be decoded from the plan: %s.", instAddr, err),
-					Subject:  &config.DeclRange,
-				})
-				continue
-			}
-
-			// If our provider schema contains sensitive values, mark those as sensitive
-			afterMarks := change.AfterValMarks
-			if schema.ContainsSensitive() {
-				afterMarks = append(afterMarks, schema.ValueMarks(val, nil)...)
-			}
-
-			instances[key] = val.MarkWithPaths(afterMarks)
+			instances[key] = change.After
 			continue
 		}
 
@@ -769,16 +710,6 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 
 		val := ios.Value
 
-		// If our schema contains sensitive values, mark those as sensitive.
-		// Since decoding the instance object can also apply sensitivity marks,
-		// we must remove and combine those before remarking to avoid a double-
-		// mark error.
-		if schema.ContainsSensitive() {
-			var marks []cty.PathValueMarks
-			val, marks = val.UnmarkDeepWithPaths()
-			marks = append(marks, schema.ValueMarks(val, nil)...)
-			val = val.MarkWithPaths(marks)
-		}
 		instances[key] = val
 	}
 
@@ -856,6 +787,115 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
 	return ret, diags
 }
 
+func (d *evaluationStateData) getEphemeralResource(addr addrs.Resource, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	if d.Operation == walkValidate || d.Operation == walkEval {
+		// Ephemeral instances are never live during the validate walk. Eval is
+		// similarly offline, and since there is no value stored we can't return
+		// anything other than dynamic.
+		return cty.DynamicVal.Mark(marks.Ephemeral), diags
+	}
+
+	// Now, we're going to build up a value that represents the resource
+	// or resources that are in the state.
+	instances := map[addrs.InstanceKey]cty.Value{}
+
+	// First, we're going to load any instances that we have written into the
+	// deferrals system. A deferred resource overrides anything that might be
+	// in the state for the resource, so we do this first.
+	for key, value := range d.Evaluator.Deferrals.GetDeferredResourceInstances(addr.Absolute(d.ModulePath)) {
+		instances[key] = value
+	}
+
+	absAddr := addr.Absolute(d.ModulePath)
+	keyType, keys, haveUnknownKeys := d.Evaluator.Instances.ResourceInstanceKeys(absAddr)
+	if haveUnknownKeys {
+		// We can probably do better than totally unknown at least for a
+		// single-instance resource, but we'll just keep it simple for now.
+		// Result must be marked as ephemeral so that we can still catch
+		// attempts to use the results in non-ephemeral locations, so that
+		// the operator doesn't end up trapped with an error on a subsequent
+		// plan/apply round.
+		return cty.DynamicVal.Mark(marks.Ephemeral), diags
+	}
+
+	ephems := d.Evaluator.EphemeralResources
+	getInstValue := func(addr addrs.AbsResourceInstance) (cty.Value, tfdiags.Diagnostics) {
+		var diags tfdiags.Diagnostics
+
+		// If we have a deferred instance with this key we don't need to check if it is live or not,
+		// it has not been created so we can just return the deferred value.
+		if v, ok := instances[addr.Resource.Key]; ok {
+			return v, diags
+		}
+
+		val, isLive := ephems.InstanceValue(addr)
+		if !isLive {
+			// If the instance is no longer "live" by the time we're accessing
+			// it then that suggests that it needed renewal and renewal has
+			// failed, and so the object's value is no longer usable. We'll
+			// still return the value in case it's somehow useful for diagnosis,
+			// but we return an error to prevent further evaluation of whatever
+			// other expression depended on the liveness of this object.
+			//
+			// This error message is written on the assumption that it will
+			// always appear alongside the provider's renewal error, but that'll
+			// be exposed only once the (now-zombied) ephemeral resource is
+			// eventually closed, so that we can avoid returning the same error
+			// multiple times.
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Ephemeral resource instance has expired",
+				Detail: fmt.Sprintf(
+					"The remote object for %s is no longer available due to a renewal error, so Terraform cannot evaluate this expression.",
+					addr,
+				),
+				Subject: rng.ToHCL().Ptr(),
+			})
+		}
+		if val == cty.NilVal {
+			val = cty.DynamicVal.Mark(marks.Ephemeral)
+		}
+		return val, diags
+	}
+
+	switch keyType {
+	case addrs.NoKeyType:
+		// For "no key" we're returning just a single object representing
+		// the single instance of this resource.
+		instVal, moreDiags := getInstValue(absAddr.Instance(addrs.NoKey))
+		diags = diags.Append(moreDiags)
+		return instVal, diags
+	case addrs.IntKeyType:
+		// For integer keys we're returning a tuple-typed value whose
+		// indices are the keys.
+		elems := make([]cty.Value, len(keys))
+		for _, key := range keys {
+			idx := int(key.(addrs.IntKey))
+			instAddr := absAddr.Instance(key)
+			instVal, moreDiags := getInstValue(instAddr)
+			diags = diags.Append(moreDiags)
+			elems[idx] = instVal
+		}
+		return cty.TupleVal(elems), diags
+	case addrs.StringKeyType:
+		// For string keys we're returning an object-typed value whose
+		// attributes are the keys.
+		attrs := make(map[string]cty.Value, len(keys))
+		for _, key := range keys {
+			attrName := string(key.(addrs.StringKey))
+			instAddr := absAddr.Instance(key)
+			instVal, moreDiags := getInstValue(instAddr)
+			diags = diags.Append(moreDiags)
+			attrs[attrName] = instVal
+		}
+		return cty.ObjectVal(attrs), diags
+	default:
+		panic(fmt.Sprintf("unhandled instance key type %#v", keyType))
+	}
+}
+
 func (d *evaluationStateData) getResourceSchema(addr addrs.Resource, providerAddr addrs.Provider) *configschema.Block {
 	schema, _, err := d.Evaluator.Plugins.ResourceTypeSchema(providerAddr, addr.Mode, addr.Type)
 	if err != nil {
@@ -867,43 +907,12 @@ func (d *evaluationStateData) getResourceSchema(addr addrs.Resource, providerAdd
 	return schema
 }
 
-func (d *evaluationStateData) GetTerraformAttr(addr addrs.TerraformAttr, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-	switch addr.Name {
-
-	case "workspace":
-		workspaceName := d.Evaluator.Meta.Env
-		return cty.StringVal(workspaceName), diags
-
-	case "env":
-		// Prior to Terraform 0.12 there was an attribute "env", which was
-		// an alias name for "workspace". This was deprecated and is now
-		// removed.
-		diags = diags.Append(&hcl.Diagnostic{
-			Severity: hcl.DiagError,
-			Summary:  `Invalid "terraform" attribute`,
-			Detail:   `The terraform.env attribute was deprecated in v0.10 and removed in v0.12. The "state environment" concept was renamed to "workspace" in v0.12, and so the workspace name can now be accessed using the terraform.workspace attribute.`,
-			Subject:  rng.ToHCL().Ptr(),
-		})
-		return cty.DynamicVal, diags
-
-	default:
-		diags = diags.Append(&hcl.Diagnostic{
-			Severity: hcl.DiagError,
-			Summary:  `Invalid "terraform" attribute`,
-			Detail:   fmt.Sprintf(`The "terraform" object does not have an attribute named %q. The only supported attribute is terraform.workspace, the name of the currently-selected workspace.`, addr.Name),
-			Subject:  rng.ToHCL().Ptr(),
-		})
-		return cty.DynamicVal, diags
-	}
-}
-
 func (d *evaluationStateData) GetOutput(addr addrs.OutputValue, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// First we'll make sure the requested value is declared in configuration,
 	// so we can produce a nice message if not.
-	moduleConfig := d.Evaluator.Config.DescendentForInstance(d.ModulePath)
+	moduleConfig := d.Evaluator.Config.DescendantForInstance(d.ModulePath)
 	if moduleConfig == nil {
 		// should never happen, since we can't be evaluating in a module
 		// that wasn't mentioned in configuration.
@@ -951,30 +960,6 @@ func (d *evaluationStateData) GetOutput(addr addrs.OutputValue, rng tfdiags.Sour
 	}
 
 	return val, diags
-}
-
-func (d *evaluationStateData) GetCheckBlock(addr addrs.Check, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
-	// For now, check blocks don't contain any meaningful data and can only
-	// be referenced from the testing scope within an expect_failures attribute.
-	//
-	// We've added them into the scope explicitly since they are referencable,
-	// but we'll actually just return an error message saying they can't be
-	// referenced in this context.
-	var diags tfdiags.Diagnostics
-	diags = diags.Append(&hcl.Diagnostic{
-		Severity: hcl.DiagError,
-		Summary:  "Reference to \"check\" in invalid context",
-		Detail:   "The \"check\" object can only be referenced from an \"expect_failures\" attribute within a Terraform testing \"run\" block.",
-		Subject:  rng.ToHCL().Ptr(),
-	})
-	return cty.NilVal, diags
-}
-
-func (d *evaluationStateData) GetRunBlock(run addrs.Run, rng tfdiags.SourceRange) (cty.Value, tfdiags.Diagnostics) {
-	// We should not get here because any scope that has an [evaluationStateData]
-	// as its Data should have a reference parser that doesn't accept addrs.Run
-	// addresses.
-	panic("GetRunBlock called on non-test evaluation dataset")
 }
 
 // moduleDisplayAddr returns a string describing the given module instance

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 syntax = "proto3";
 package tfstackdata1;
@@ -43,10 +43,15 @@ message PlanHeader {
     // decoding the message, because we always expect plans to be applied by
     // the same version of Terraform that created them.
     string terraform_version = 1;
+}
 
-    // A verbatim copy of the state that was provided with the request to
-    // create the plan.
-    map<string, google.protobuf.Any> prev_run_state_raw = 2;
+// Captures one element from the raw prior state that was provided when
+// creating the plan. A valid plan includes a copy of its entire prior state
+// represented as zero or more messages of this type, which we then interpret
+// as a map from key to raw during load.
+message PlanPriorStateElem {
+    string key = 1;
+    google.protobuf.Any raw = 2;
 }
 
 // Confirms whether the overall plan whose raw plan sequence includes this
@@ -61,13 +66,41 @@ message PlanApplyable {
     bool applyable = 1;
 }
 
+// Records the plan timestamp to be used for all components and the stacks language.
+message PlanTimestamp {
+    string plan_timestamp = 1;
+}
+
 // Records the value of one of the main stack's input values during planning.
 //
 // These values get fixed during the plan phase so that we can ensure that we
 // use identical values when subsequently applying the plan.
 message PlanRootInputValue {
     string name = 1;
-    tfplan.DynamicValue value = 2;
+    DynamicValue value = 2;
+    bool required_on_apply = 3;
+}
+
+// Records that a root input variable should be deleted by the apply operation.
+message DeletedRootInputVariable {
+    string name = 1;
+}
+
+// Records that a root output should be deleted by the apply operation.
+message DeletedRootOutputValue {
+    string name = 1;
+}
+
+// Records that a component should just be deleted from the state.
+message DeletedComponent {
+    string component_instance_addr = 1;
+}
+
+// ProviderFunctionResults stores a record of the results of provider functions
+// that were called during the planning phase. This is used to ensure that the
+// same results are returned during the apply phase.
+message ProviderFunctionResults {
+    repeated tfplan.ProviderFunctionCallHash provider_function_results = 1;
 }
 
 // Represents the existence of a particular component instance, and so must
@@ -93,6 +126,95 @@ message PlanComponentInstance {
     // the input to subsequently applying the component plan but the final
     // input values should be a valid concretization of what's described here.
     map<string, DynamicValue> planned_input_values = 3;
+
+    // The action planned for the component as a whole.
+    //
+    // This does not directly incorporate actions planned for resource
+    // instances within this component instance, but does capture a sense
+    // of the overall action being taken for this particular component
+    // instance.
+    //
+    // The currently-possible values are:
+    //   - CREATE and UPDATE both describe applying a "normal" plan, where
+    //     CREATE additionally represents that the component instance
+    //     did not previously exist.
+    //   - READ describes a refresh-only plan. This is currently possible only
+    //     if the overall stack plan is refresh-only.
+    //   - DELETE describes applying a destroy plan, with the intent of
+    //     deleting all remote objects currently bound to resource instances
+    //     in this component instance.
+    //
+    // The value recorded here is used to achieve a few variations needed in
+    // the apply phase.
+    tfplan.Action planned_action = 4;
+
+    // The mode that was used to plan this component.
+    //
+    // This is used to determine the behavior of the apply phase for this
+    // component instance.
+    //
+    // Ideally, we wouldn't need to include this at all as the plan should
+    // contain everything we need without a general mode. However, this is
+    // not currently the case. See context_apply.go:332 for more details.
+    // TODO: Remove this once walkDestroy has been properly audited.
+    tfplan.Mode mode = 10;
+
+    // The appliability flag decided by the modules runtime for this component's
+    // plan. See the docs for plans.Plan.Applyable for details on what this
+    // represents. (It's here largely just so that we can repopulate it
+    // faithfully when we rebuild a plans.Plan object at apply time.)
+    bool plan_applyable = 7;
+
+    // The completion flag decided by the modules runtime for this component's
+    // plan. See the docs for plans.Plan.Complete for details on what this
+    // represents. (It's here largely just so that we can repopulate it
+    // faithfully when we rebuild a plans.Plan object at apply time.)
+    bool plan_complete = 8;
+
+    // A list of absolute component addresses that this component
+    // instance depends on according to the configuration the plan was
+    // created from. (These are components rather than component instances
+    // because the stacks language evaluation model uses components as the
+    // most specific granularity for dependency resolution.)
+    //
+    // Applying this component instance's plan must wait until any
+    // CREATE or UPDATE plans for any of the listed component instances have
+    // completed successfully. Additionally, if any of the component instances
+    // listed here have DELETE plans then this component instance must also
+    // have a DELETE plan and the upstream DELETE must wait until this one
+    // has completed.
+    //
+    // A component instance plan that is not DELETE cannot depend on another
+    // component instance that is not also DELETE, since that would imply that
+    // this component instance's configuration refers to a component that isn't
+    // declared, which should therefore have failed validation.
+    repeated string depends_on_component_addrs = 5;
+
+    // Captures an approximation of the output values for this component with
+    // as much detail as we knew during the planning phase.
+    //
+    // For any planned action other than DELETE this might contain unknown
+    // values as placeholders for values that won't be determined until the
+    // apply phase
+    //
+    // For a DELETE plan the values should always be known because they are
+    // based on the prior state for the component, before it has been destroyed.
+    // The apply phase should use these values to build the representation of
+    // the component instance as an expression, because for DELETE any
+    // dependent objects must also be pending DELETE and their delete must
+    // happen before this instance is destroyed.
+    map<string, DynamicValue> planned_output_values = 6;
+
+    // A list of check results for this component instance, as produced by
+    // the modules runtime during the planning phase. The apply expects to
+    // update check results which were unknown during planning to reflect
+    // the actual results from the apply phase.
+    repeated tfplan.CheckResults planned_check_results = 9;
+
+    // The set of provider function results that were produced during the
+    // planning phase for this component instance. These results are used
+    // to ensure that the same results are returned during the apply phase.
+    repeated tfplan.ProviderFunctionCallHash provider_function_results = 11;
 }
 
 // Represents a planned change to a particular resource instance within a
@@ -123,6 +245,13 @@ message PlanResourceInstanceChangePlanned {
     // prior state has already been updated to match the "old" value from
     // the "change" message.
     StateResourceInstanceObjectV1 prior_state = 3;
+}
+
+// Represents a deferred change to a particular resource instance within a
+// particular component instance.
+message PlanDeferredResourceInstanceChange {
+    tfplan.Deferred deferred = 1;
+    PlanResourceInstanceChangePlanned change = 2;
 }
 
 // Represents that we need to emit "delete" requests for one or more raw
@@ -189,6 +318,25 @@ message StateComponentInstanceV1 {
     // but yet we still need to have _some_ output values to use when planning
     // and applying other component instances that refer to this one.
     map<string, DynamicValue> output_values = 1;
+
+    // The input variables for this component instance as reported from the
+    // most recent apply action. We retain this only for usage within removed
+    // blocks, where we need to know the input variables to be able to plan
+    // and apply the destroy action without asking the user to resupply or
+    // remember them.
+    map<string, DynamicValue> input_variables = 2;
+
+    // The absolute configuration addresses of components that this component
+    // instance depended on when it was created. We preserve this information
+    // to help with plan and apply ordering during destroy plans or for removed
+    // blocks.
+    repeated string dependency_addrs = 3;
+
+    // The absolute configuration addresses of components that depended on this
+    // component instance when it was created. We preserve this information
+    // to help with plan and apply ordering during destroy plans or for removed
+    // blocks.
+    repeated string dependent_addrs = 4;
 }
 
 // Represents the existence of a particular resource instance object in a

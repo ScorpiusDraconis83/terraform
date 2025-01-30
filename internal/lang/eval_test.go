@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -35,6 +36,9 @@ func TestScopeEvalContext(t *testing.T) {
 			}),
 			"data.null_data_source.foo": cty.ObjectVal(map[string]cty.Value{
 				"attr": cty.StringVal("bar"),
+			}),
+			"ephemeral.null_secret.foo": cty.ObjectVal(map[string]cty.Value{
+				"attr": cty.StringVal("ephemeral"),
 			}),
 			"null_resource.multi": cty.TupleVal([]cty.Value{
 				cty.ObjectVal(map[string]cty.Value{
@@ -320,6 +324,18 @@ func TestScopeEvalContext(t *testing.T) {
 			},
 		},
 		{
+			Expr: `ephemeral.null_secret.foo`,
+			Want: map[string]cty.Value{
+				"ephemeral": cty.ObjectVal(map[string]cty.Value{
+					"null_secret": cty.ObjectVal(map[string]cty.Value{
+						"foo": cty.ObjectVal(map[string]cty.Value{
+							"attr": cty.StringVal("ephemeral"),
+						}),
+					}),
+				}),
+			},
+		},
+		{
 			Expr: `module.foo`,
 			Want: map[string]cty.Value{
 				"module": cty.ObjectVal(map[string]cty.Value{
@@ -420,7 +436,7 @@ func TestScopeEvalContext(t *testing.T) {
 		},
 	}
 
-	exec := func(t *testing.T, parseRef ParseRef, test struct {
+	exec := func(t *testing.T, parseRef langrefs.ParseRef, test struct {
 		Expr        string
 		Want        map[string]cty.Value
 		TestingOnly bool
@@ -434,7 +450,7 @@ func TestScopeEvalContext(t *testing.T) {
 			return
 		}
 
-		refs, refsDiags := ReferencesInExpr(parseRef, expr)
+		refs, refsDiags := langrefs.ReferencesInExpr(parseRef, expr)
 		if refsDiags.HasErrors() {
 			t.Fatal(refsDiags.Err())
 		}

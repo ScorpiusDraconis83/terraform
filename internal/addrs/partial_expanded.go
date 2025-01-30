@@ -6,6 +6,12 @@ package addrs
 import (
 	"fmt"
 	"strings"
+
+	"github.com/hashicorp/hcl/v2"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/gocty"
+
+	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
 // PartialExpandedModule represents a set of module instances which all share
@@ -29,11 +35,187 @@ type PartialExpandedModule struct {
 	unexpandedSuffix Module
 }
 
+// ParsePartialExpandedModule parses a module address traversal and returns a
+// PartialExpandedModule representing the known and unknown parts of the
+// address.
+//
+// It returns the parsed PartialExpandedModule, the remaining traversal steps
+// that were not consumed by this function, and any diagnostics that were
+// generated during parsing.
+func ParsePartialExpandedModule(traversal hcl.Traversal) (PartialExpandedModule, hcl.Traversal, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	remain := traversal
+	var partial PartialExpandedModule
+
+	// We'll step through the traversal steps and build up the known prefix
+	// of the module address. When we reach a call with an unknown index, we'll
+	// switch to building up the unexpanded suffix.
+	expanded := true
+
+LOOP:
+	for len(remain) > 0 {
+		var next string
+		switch tt := remain[0].(type) {
+		case hcl.TraverseRoot:
+			next = tt.Name
+		case hcl.TraverseAttr:
+			next = tt.Name
+		default:
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid address operator",
+				Detail:   "Module address prefix must be followed by dot and then a name.",
+				Subject:  remain[0].SourceRange().Ptr(),
+			})
+			break LOOP
+		}
+
+		if next != "module" {
+			break
+		}
+
+		kwRange := remain[0].SourceRange()
+		remain = remain[1:]
+		if len(remain) == 0 {
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid address operator",
+				Detail:   "Prefix \"module.\" must be followed by a module name.",
+				Subject:  &kwRange,
+			})
+			break
+		}
+
+		var moduleName string
+		switch tt := remain[0].(type) {
+		case hcl.TraverseAttr:
+			moduleName = tt.Name
+		default:
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid address operator",
+				Detail:   "Prefix \"module.\" must be followed by a module name.",
+				Subject:  remain[0].SourceRange().Ptr(),
+			})
+			break LOOP
+		}
+		remain = remain[1:]
+
+		if expanded {
+
+			step := ModuleInstanceStep{
+				Name: moduleName,
+			}
+
+			if len(remain) > 0 {
+				if idx, ok := remain[0].(hcl.TraverseIndex); ok {
+					remain = remain[1:]
+
+					if !idx.Key.IsKnown() {
+						// We'll switch to building up the unexpanded suffix
+						// starting with this step.
+						expanded = false
+						partial.unexpandedSuffix = append(partial.unexpandedSuffix, moduleName)
+						continue
+					}
+
+					switch idx.Key.Type() {
+					case cty.String:
+						step.InstanceKey = StringKey(idx.Key.AsString())
+					case cty.Number:
+						var idxInt int
+						err := gocty.FromCtyValue(idx.Key, &idxInt)
+						if err == nil {
+							step.InstanceKey = IntKey(idxInt)
+						} else {
+							diags = diags.Append(&hcl.Diagnostic{
+								Severity: hcl.DiagError,
+								Summary:  "Invalid address operator",
+								Detail:   fmt.Sprintf("Invalid module index: %s.", err),
+								Subject:  idx.SourceRange().Ptr(),
+							})
+						}
+					default:
+						// Should never happen, because no other types are allowed in traversal indices.
+						diags = diags.Append(&hcl.Diagnostic{
+							Severity: hcl.DiagError,
+							Summary:  "Invalid address operator",
+							Detail:   "Invalid module key: must be either a string or an integer.",
+							Subject:  idx.SourceRange().Ptr(),
+						})
+					}
+				}
+			}
+
+			partial.expandedPrefix = append(partial.expandedPrefix, step)
+			continue
+		}
+
+		// Otherwise, we'll process this as an unexpanded suffix.
+		partial.unexpandedSuffix = append(partial.unexpandedSuffix, moduleName)
+
+		if len(remain) > 0 {
+			if _, ok := remain[0].(hcl.TraverseIndex); ok {
+				// Then we have a module instance key. We're now parsing the
+				// unexpanded suffix of the module address, so we'll just
+				// ignore it.
+				remain = remain[1:]
+			}
+		}
+	}
+
+	var retRemain hcl.Traversal
+	if len(remain) > 0 {
+		retRemain = make(hcl.Traversal, len(remain))
+		copy(retRemain, remain)
+		// The first element here might be either a TraverseRoot or a
+		// TraverseAttr, depending on whether we had a module address on the
+		// front. To make life easier for callers, we'll normalize to always
+		// start with a TraverseRoot.
+		if tt, ok := retRemain[0].(hcl.TraverseAttr); ok {
+			retRemain[0] = hcl.TraverseRoot{
+				Name:     tt.Name,
+				SrcRange: tt.SrcRange,
+			}
+		}
+	}
+
+	return partial, retRemain, diags
+}
+
 func (m ModuleInstance) UnexpandedChild(call ModuleCall) PartialExpandedModule {
 	return PartialExpandedModule{
 		expandedPrefix:   m,
 		unexpandedSuffix: Module{call.Name},
 	}
+}
+
+// PartialModule reverses the process of UnknownModuleInstance by converting a
+// ModuleInstance back into a PartialExpandedModule.
+func (m ModuleInstance) PartialModule() PartialExpandedModule {
+	pem := PartialExpandedModule{}
+	for _, step := range m {
+		if step.InstanceKey == WildcardKey {
+			pem.unexpandedSuffix = append(pem.unexpandedSuffix, step.Name)
+			continue
+		}
+		pem.expandedPrefix = append(pem.expandedPrefix, step)
+	}
+	return pem
+}
+
+// UnknownModuleInstance expands the receiver to a full ModuleInstance by
+// replacing the unknown instance keys with a wildcard value.
+func (pem PartialExpandedModule) UnknownModuleInstance() ModuleInstance {
+	base := pem.expandedPrefix
+	for _, call := range pem.unexpandedSuffix {
+		base = append(base, ModuleInstanceStep{
+			Name:        call,
+			InstanceKey: WildcardKey,
+		})
+	}
+	return base
 }
 
 // LevelsKnown returns the number of module path segments of the address that
@@ -195,8 +377,8 @@ func (pem PartialExpandedModule) String() string {
 	return buf.String()
 }
 
-func (per PartialExpandedModule) UniqueKey() UniqueKey {
-	return partialExpandedModuleKey(per.String())
+func (pem PartialExpandedModule) UniqueKey() UniqueKey {
+	return partialExpandedModuleKey(pem.String())
 }
 
 type partialExpandedModuleKey string
@@ -231,6 +413,107 @@ type PartialExpandedResource struct {
 	resource Resource
 }
 
+// ParsePartialExpandedResource parses a resource address traversal and returns
+// a PartialExpandedResource representing the known and unknown parts of the
+// address.
+func ParsePartialExpandedResource(traversal hcl.Traversal) (PartialExpandedResource, hcl.Traversal, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
+	pem, remain, diags := ParsePartialExpandedModule(traversal)
+	if len(remain) == 0 {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid address",
+			Detail:   "Resource address must be a module address followed by a resource address.",
+			Subject:  traversal.SourceRange().Ptr(),
+		})
+		return PartialExpandedResource{}, nil, diags
+	}
+
+	// We know that remain[0] is a hcl.TraverseRoot object as the
+	// ParsePartialExpandedModule function always returns a hcl.TraverseRoot
+	// object as the first element in the remain slice.
+
+	mode := ManagedResourceMode
+	if remain.RootName() == "data" {
+		mode = DataResourceMode
+		remain = remain[1:]
+	} else if remain.RootName() == "resource" {
+		// Starting a resource address with "resource" is optional, so we'll
+		// just ignore it if it's present.
+		remain = remain[1:]
+	}
+
+	if len(remain) < 2 {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid address",
+			Detail:   "Resource specification must include a resource type and name.",
+			Subject:  remain.SourceRange().Ptr(),
+		})
+		return PartialExpandedResource{}, nil, diags
+	}
+
+	var typeName, name string
+	switch tt := remain[0].(type) {
+	case hcl.TraverseRoot:
+		typeName = tt.Name
+	case hcl.TraverseAttr:
+		typeName = tt.Name
+	default:
+		switch mode {
+		case ManagedResourceMode:
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid address",
+				Detail:   "A resource type name is required.",
+				Subject:  remain[0].SourceRange().Ptr(),
+			})
+		case DataResourceMode:
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid address",
+				Detail:   "A data source name is required.",
+				Subject:  remain[0].SourceRange().Ptr(),
+			})
+		default:
+			panic("unknown mode")
+		}
+		return PartialExpandedResource{}, nil, diags
+	}
+
+	switch tt := remain[1].(type) {
+	case hcl.TraverseAttr:
+		name = tt.Name
+	default:
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid address",
+			Detail:   "A resource name is required.",
+			Subject:  remain[1].SourceRange().Ptr(),
+		})
+		return PartialExpandedResource{}, nil, diags
+	}
+
+	remain = remain[2:]
+	if len(remain) > 0 {
+		if _, ok := remain[0].(hcl.TraverseIndex); ok {
+			// Then we have a resource instance key. Since, we're building a
+			// PartialExpandedResource, we'll just ignore it.
+			remain = remain[1:]
+		}
+	}
+
+	return PartialExpandedResource{
+		module: pem,
+		resource: Resource{
+			Mode: mode,
+			Type: typeName,
+			Name: name,
+		},
+	}, remain, diags
+}
+
 // UnexpandedResource returns the address of a child resource expressed as a
 // [PartialExpandedResource].
 //
@@ -261,6 +544,25 @@ func (r AbsResource) UnexpandedResource() PartialExpandedResource {
 	}
 }
 
+// PartialResource reverses UnknownResourceInstance by converting the
+// AbsResourceInstance back into a PartialExpandedResource.
+func (r AbsResourceInstance) PartialResource() PartialExpandedResource {
+	return PartialExpandedResource{
+		module:   r.Module.PartialModule(),
+		resource: r.Resource.Resource,
+	}
+}
+
+// UnknownResourceInstance returns an [AbsResourceInstance] that represents the
+// same resource as the receiver but with all instance keys replaced with a
+// wildcard value.
+func (per PartialExpandedResource) UnknownResourceInstance() AbsResourceInstance {
+	return AbsResourceInstance{
+		Module:   per.module.UnknownModuleInstance(),
+		Resource: per.resource.Instance(WildcardKey),
+	}
+}
+
 // MatchesInstance returns true if and only if the given resource instance
 // belongs to the recieving partially-expanded resource address pattern.
 func (per PartialExpandedResource) MatchesInstance(inst AbsResourceInstance) bool {
@@ -277,6 +579,16 @@ func (per PartialExpandedResource) MatchesResource(inst AbsResource) bool {
 		return false
 	}
 	return inst.Resource.Equal(per.resource)
+}
+
+// MatchesPartial returns true if the underlying partial module address matches
+// the given partial module address and the resource type and name match the
+// receiver's resource type and name.
+func (per PartialExpandedResource) MatchesPartial(other PartialExpandedResource) bool {
+	if !per.module.MatchesPartial(other.module) {
+		return false
+	}
+	return per.resource.Equal(other.resource)
 }
 
 // AbsResource returns the single [AbsResource] that this address represents
@@ -321,6 +633,133 @@ func (per PartialExpandedResource) Resource() Resource {
 // [PartialExpandedResource.AbsResource].
 func (per PartialExpandedResource) KnownModuleInstancePrefix() ModuleInstance {
 	return per.module.KnownPrefix()
+}
+
+// ModuleInstance returns the fully-qualified [ModuleInstance] that this
+// partial-expanded resource belongs to, but only if its module instance
+// address is fully known.
+//
+// The second return value is false if the module instance address is not
+// fully expanded, in which case the first return value is invalid. Use
+// [PartialExpandedResource.PartialExpandedModule] instead in that case.
+func (per PartialExpandedResource) ModuleInstance() (ModuleInstance, bool) {
+	if len(per.module.unexpandedSuffix) != 0 {
+		return nil, false
+	}
+	return per.module.expandedPrefix, true
+}
+
+// PartialExpandedModule returns a [PartialExpandedModule] address describing
+// the partially-unknown module instance address that the resource belongs to,
+// but only if the module instance address is not fully known.
+//
+// The second return value is false if the module instance address is actually
+// fully expanded, in which case the first return value is invalid. Use
+// [PartialExpandedResource.ModuleInstance] instead in that case.
+func (per PartialExpandedResource) PartialExpandedModule() (PartialExpandedModule, bool) {
+	if len(per.module.unexpandedSuffix) == 0 {
+		return PartialExpandedModule{}, false
+	}
+	return per.module, true
+}
+
+// IsTargetedBy returns true if and only if the given targetable address might
+// target the resource instances that could exist if the receiver were fully
+// expanded.
+func (per PartialExpandedResource) IsTargetedBy(addr Targetable) bool {
+
+	compareModule := func(module Module) bool {
+		// We'll step through each step in the module address and compare it
+		// to the known prefix and unexpanded suffix of the receiver. If we
+		// find a mismatch then we know the receiver can't be targeted by this
+		// address.
+		for ix, step := range module {
+			if ix >= len(per.module.expandedPrefix) {
+				ix = ix - len(per.module.expandedPrefix)
+				if ix >= len(per.module.unexpandedSuffix) {
+					// Then the target address has more steps than the receiver
+					// and so can't possibly target it.
+					return false
+				}
+				if step != per.module.unexpandedSuffix[ix] {
+					// Then the target address has a different step at this
+					// position than the receiver does, so it can't target it.
+					return false
+				}
+			} else {
+				if step != per.module.expandedPrefix[ix].Name {
+					// Then the target address has a different step at this
+					// position than the receiver does, so it can't target it.
+					return false
+				}
+			}
+		}
+
+		// If we make it here then the target address is a prefix of the
+		// receivers module address, so it could potentially target the
+		// receiver.
+		return true
+	}
+
+	compareModuleInstance := func(inst ModuleInstance) bool {
+		// We'll step through each step in the module address and compare it
+		// to the known prefix and unexpanded suffix of the receiver. If we
+		// find a mismatch then we know the receiver can't be targeted by this
+		// address.
+		for ix, step := range inst {
+			if ix >= len(per.module.expandedPrefix) {
+				ix = ix - len(per.module.expandedPrefix)
+				if ix >= len(per.module.unexpandedSuffix) {
+					// Then the target address has more steps than the receiver
+					// and so can't possibly target it.
+					return false
+				}
+				if step.Name != per.module.unexpandedSuffix[ix] {
+					// Then the target address has a different step at this
+					// position than the receiver does, so it can't target it.
+					return false
+				}
+			} else {
+				if step.Name != per.module.expandedPrefix[ix].Name || (step.InstanceKey != NoKey && step.InstanceKey != per.module.expandedPrefix[ix].InstanceKey) {
+					// Then the target address has a different step at this
+					// position than the receiver does, so it can't target it.
+					return false
+				}
+			}
+		}
+
+		// If we make it here then the target address is a prefix of the
+		// receivers module address, so it could potentially target the
+		// receiver.
+		return true
+	}
+
+	switch addr.AddrType() {
+	case ConfigResourceAddrType:
+		addr := addr.(ConfigResource)
+		if !compareModule(addr.Module) {
+			return false
+		}
+		return addr.Resource.Equal(per.resource)
+	case AbsResourceAddrType:
+		addr := addr.(AbsResource)
+		if !compareModuleInstance(addr.Module) {
+			return false
+		}
+		return addr.Resource.Equal(per.resource)
+	case AbsResourceInstanceAddrType:
+		addr := addr.(AbsResourceInstance)
+		if !compareModuleInstance(addr.Module) {
+			return false
+		}
+		return addr.Resource.Resource.Equal(per.resource)
+	case ModuleAddrType:
+		return compareModule(addr.(Module))
+	case ModuleInstanceAddrType:
+		return compareModuleInstance(addr.(ModuleInstance))
+	}
+
+	return false
 }
 
 // String returns a string representation of the pattern which uses the special

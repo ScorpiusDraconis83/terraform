@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/didyoumean"
 	"github.com/hashicorp/terraform/internal/lang"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -58,6 +59,7 @@ func NewEvalContext(run *Run, module *configs.Module, resultScope *lang.Scope, e
 		BaseDir:       resultScope.BaseDir,
 		PureOnly:      resultScope.PureOnly,
 		PlanTimestamp: resultScope.PlanTimestamp,
+		ExternalFuncs: resultScope.ExternalFuncs,
 	}
 	return &EvalContext{
 		run:       run,
@@ -84,16 +86,30 @@ func (ec *EvalContext) Evaluate() (Status, cty.Value, tfdiags.Diagnostics) {
 	for i, rule := range run.Config.CheckRules {
 		var ruleDiags tfdiags.Diagnostics
 
-		refs, moreDiags := lang.ReferencesInExpr(addrs.ParseRefFromTestingScope, rule.Condition)
+		refs, moreDiags := langrefs.ReferencesInExpr(addrs.ParseRefFromTestingScope, rule.Condition)
 		ruleDiags = ruleDiags.Append(moreDiags)
-		moreRefs, moreDiags := lang.ReferencesInExpr(addrs.ParseRefFromTestingScope, rule.ErrorMessage)
+		moreRefs, moreDiags := langrefs.ReferencesInExpr(addrs.ParseRefFromTestingScope, rule.ErrorMessage)
 		ruleDiags = ruleDiags.Append(moreDiags)
 		refs = append(refs, moreRefs...)
 
+		// We want to emit diagnostics if users are using ephemeral resources in their checks
+		// as they are not supported since they are closed before this is evaluated.
+		// We do not remove the diagnostic about the ephemeral resource being closed already as it
+		// might be useful to the user.
+		ruleDiags = ruleDiags.Append(diagsForEphemeralResources(refs))
+
 		hclCtx, moreDiags := scope.EvalContext(refs)
 		ruleDiags = ruleDiags.Append(moreDiags)
+		if moreDiags.HasErrors() {
+			// if we can't evaluate the context properly, we can't evaulate the rule
+			// we add the diagnostics to the main diags and continue to the next rule
+			log.Printf("[TRACE] EvalContext.Evaluate: check rule %d for %s is invalid, could not evalaute the context, so cannot evaluate it", i, ec.run.Addr())
+			status = status.Merge(Error)
+			diags = diags.Append(ruleDiags)
+			continue
+		}
 
-		errorMessage, moreDiags := lang.EvalCheckErrorMessage(rule.ErrorMessage, hclCtx)
+		errorMessage, moreDiags := lang.EvalCheckErrorMessage(rule.ErrorMessage, hclCtx, nil)
 		ruleDiags = ruleDiags.Append(moreDiags)
 
 		runVal, hclDiags := rule.Condition.Value(hclCtx)
@@ -125,7 +141,7 @@ func (ec *EvalContext) Evaluate() (Status, cty.Value, tfdiags.Diagnostics) {
 			diags = diags.Append(&hcl.Diagnostic{
 				Severity:    hcl.DiagError,
 				Summary:     "Unknown condition value",
-				Detail:      "Condition expression could not be evaluated at this time. This means you have executed a `run` block with `command = plan` and one of the values your condition depended on is not known until after the plan has been applied. Either remove this value from your condition, or execute an `apply` command from this `run` block.",
+				Detail:      "Condition expression could not be evaluated at this time. This means you have executed a `run` block with `command = plan` and one of the values your condition depended on is not known until after the plan has been applied. Either remove this value from your condition, or execute an `apply` command from this `run` block. Alternatively, if there is an override for this value, you can make it available during the plan phase by setting `override_during = plan` in the `override_` block.",
 				Subject:     rule.Condition.Range().Ptr(),
 				Expression:  rule.Condition,
 				EvalContext: hclCtx,
@@ -163,6 +179,8 @@ func (ec *EvalContext) Evaluate() (Status, cty.Value, tfdiags.Diagnostics) {
 				Subject:     rule.Condition.Range().Ptr(),
 				Expression:  rule.Condition,
 				EvalContext: hclCtx,
+				// Make the ephemerality visible
+				Extra: terraform.DiagnosticCausedByEphemeral(true),
 			})
 			continue
 		} else {
@@ -186,6 +204,23 @@ func (ec *EvalContext) Evaluate() (Status, cty.Value, tfdiags.Diagnostics) {
 	}
 
 	return status, cty.ObjectVal(outputVals), diags
+}
+
+func diagsForEphemeralResources(refs []*addrs.Reference) (diags tfdiags.Diagnostics) {
+	for _, ref := range refs {
+		switch v := ref.Subject.(type) {
+		case addrs.ResourceInstance:
+			if v.Resource.Mode == addrs.EphemeralResourceMode {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Ephemeral resources cannot be asserted",
+					Detail:   "Ephemeral resources are closed when the test is finished, and are not available within the test context for assertions.",
+					Subject:  ref.SourceRange.ToHCL().Ptr(),
+				})
+			}
+		}
+	}
+	return diags
 }
 
 // evaluationData augments an underlying lang.Data -- presumably resulting

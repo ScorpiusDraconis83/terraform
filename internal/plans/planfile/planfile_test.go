@@ -11,9 +11,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs/configload"
 	"github.com/hashicorp/terraform/internal/depsfile"
-	"github.com/hashicorp/terraform/internal/getproviders"
+	"github.com/hashicorp/terraform/internal/getproviders/providerreqs"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/states/statefile"
@@ -53,11 +54,12 @@ func TestRoundtrip(t *testing.T) {
 	// Minimal plan too, since the serialization of the tfplan portion of the
 	// file is tested more fully in tfplan_test.go .
 	planIn := &plans.Plan{
-		Changes: &plans.Changes{
+		Changes: &plans.ChangesSrc{
 			Resources: []*plans.ResourceInstanceChangeSrc{},
 			Outputs:   []*plans.OutputChangeSrc{},
 		},
-		DriftedResources: []*plans.ResourceInstanceChangeSrc{},
+		DriftedResources:  []*plans.ResourceInstanceChangeSrc{},
+		DeferredResources: []*plans.DeferredResourceInstanceChangeSrc{},
 		VariableValues: map[string]plans.DynamicValue{
 			"foo": plans.DynamicValue([]byte("foo placeholder")),
 		},
@@ -81,10 +83,10 @@ func TestRoundtrip(t *testing.T) {
 	locksIn := depsfile.NewLocks()
 	locksIn.SetProvider(
 		addrs.NewDefaultProvider("boop"),
-		getproviders.MustParseVersion("1.0.0"),
-		getproviders.MustParseVersionConstraints(">= 1.0.0"),
-		[]getproviders.Hash{
-			getproviders.MustParseHash("fake:hello"),
+		providerreqs.MustParseVersion("1.0.0"),
+		providerreqs.MustParseVersionConstraints(">= 1.0.0"),
+		[]providerreqs.Hash{
+			providerreqs.MustParseHash("fake:hello"),
 		},
 	)
 
@@ -118,7 +120,7 @@ func TestRoundtrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to read plan: %s", err)
 		}
-		if diff := cmp.Diff(planIn, planOut); diff != "" {
+		if diff := cmp.Diff(planIn, planOut, collections.CmpOptions); diff != "" {
 			t.Errorf("plan did not survive round-trip\n%s", diff)
 		}
 	})

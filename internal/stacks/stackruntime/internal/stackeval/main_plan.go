@@ -7,11 +7,12 @@ import (
 	"context"
 	"sync/atomic"
 
+	"google.golang.org/protobuf/types/known/anypb"
+
 	"github.com/hashicorp/terraform/internal/promising"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
-	"google.golang.org/protobuf/types/known/anypb"
 )
 
 // PlanAll visits all of the objects in the configuration and the prior state,
@@ -43,7 +44,16 @@ func (m *Main) PlanAll(ctx context.Context, outp PlanOutput) {
 	}
 	outp.AnnouncePlannedChange(ctx, &stackplan.PlannedChangeHeader{
 		TerraformVersion: version.SemVer,
-		PrevRunStateRaw:  prevRunStateRaw,
+	})
+	for k, raw := range prevRunStateRaw {
+		outp.AnnouncePlannedChange(ctx, &stackplan.PlannedChangePriorStateElement{
+			Key: k,
+			Raw: raw,
+		})
+	}
+
+	outp.AnnouncePlannedChange(ctx, &stackplan.PlannedChangePlannedTimestamp{
+		PlannedTimestamp: m.PlanTimestamp(),
 	})
 
 	// TODO: Announce an extra planned change here if we have any unrecognized
@@ -136,6 +146,17 @@ func (m *Main) PlanAll(ctx context.Context, outp PlanOutput) {
 		outp.AnnounceDiagnostics(ctx, diags)
 	}
 
+	// Now, that we've finished walking the graph. We'll announce the
+	// provider function results so that they can be used during the apply
+	// phase.
+	hashes := m.providerFunctionResults.GetHashes()
+	if len(hashes) > 0 {
+		// Only add this planned change if we actually have any results.
+		outp.AnnouncePlannedChange(ctx, &stackplan.PlannedChangeProviderFunctionResults{
+			Results: m.providerFunctionResults.GetHashes(),
+		})
+	}
+
 	// The caller (in stackruntime) is responsible for generating the final
 	// stackplan.PlannedChangeApplyable message, just in case it detects
 	// problems of its own before finally returning.
@@ -183,7 +204,7 @@ func (m *Main) walkPlanObjectChanges(ctx context.Context, walk *planWalk, obj Pl
 			walk.out.AnnouncePlannedChange(ctx, change)
 		}
 		if len(diags) != 0 {
-			walk.out.AnnounceDiagnostics(ctx, diags)
+			walk.state.AddDiags(diags)
 		}
 	})
 }

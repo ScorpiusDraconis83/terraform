@@ -5,7 +5,6 @@ package json
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,9 +13,10 @@ import (
 	"github.com/hashicorp/hcl/v2/hcled"
 	"github.com/hashicorp/hcl/v2/hclparse"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/tfdiags"
-	"github.com/zclconf/go-cty/cty"
 )
 
 // These severities map to the tfdiags.Severity values, plus an explicit
@@ -275,6 +275,7 @@ func NewDiagnostic(diag tfdiags.Diagnostic, sources map[string][]byte) *Diagnost
 				values := make([]DiagnosticExpressionValue, 0, len(vars))
 				seen := make(map[string]struct{}, len(vars))
 				includeUnknown := tfdiags.DiagnosticCausedByUnknown(diag)
+				includeEphemeral := tfdiags.DiagnosticCausedByEphemeral(diag)
 				includeSensitive := tfdiags.DiagnosticCausedBySensitive(diag)
 			Traversals:
 				for _, traversal := range vars {
@@ -288,14 +289,41 @@ func NewDiagnostic(diag tfdiags.Diagnostic, sources map[string][]byte) *Diagnost
 							continue
 						}
 
-						traversalStr := traversalStr(traversal)
+						traversalStr := tfdiags.TraversalStr(traversal)
 						if _, exists := seen[traversalStr]; exists {
 							continue Traversals // don't show duplicates when the same variable is referenced multiple times
 						}
 						value := DiagnosticExpressionValue{
 							Traversal: traversalStr,
 						}
+						// We'll skip any value that has a mark that we don't
+						// know how to handle, because in that case we can't
+						// know what that mark is intended to represent and so
+						// must be conservative.
+						_, valMarks := val.Unmark()
+						for mark := range valMarks {
+							switch mark {
+							case marks.Sensitive, marks.Ephemeral:
+								// These are handled below
+								continue
+							default:
+								// All other marks are unhandled, so we'll
+								// skip this traversal entirely.
+								continue Traversals
+							}
+						}
 						switch {
+						case val.HasMark(marks.Sensitive) && val.HasMark(marks.Ephemeral):
+							// We only mention the combination of sensitive and ephemeral
+							// values if the diagnostic we're rendering is explicitly
+							// marked as being caused by sensitive and ephemeral values,
+							// because otherwise readers tend to be misled into thinking the error
+							// is caused by the sensitive value even when it isn't.
+							if !includeSensitive || !includeEphemeral {
+								continue Traversals
+							}
+
+							value.Statement = "has an ephemeral, sensitive value"
 						case val.HasMark(marks.Sensitive):
 							// We only mention a sensitive value if the diagnostic
 							// we're rendering is explicitly marked as being
@@ -309,6 +337,11 @@ func NewDiagnostic(diag tfdiags.Diagnostic, sources map[string][]byte) *Diagnost
 							// in order to minimize the chance of giving away
 							// whatever was sensitive about it.
 							value.Statement = "has a sensitive value"
+						case val.HasMark(marks.Ephemeral):
+							if !includeEphemeral {
+								continue Traversals
+							}
+							value.Statement = "has an ephemeral value"
 						case !val.IsKnown():
 							// We'll avoid saying anything about unknown or
 							// "known after apply" unless the diagnostic is
@@ -349,7 +382,7 @@ func NewDiagnostic(diag tfdiags.Diagnostic, sources map[string][]byte) *Diagnost
 								value.Statement = "will be known only after apply"
 							}
 						default:
-							value.Statement = fmt.Sprintf("is %s", compactValueStr(val))
+							value.Statement = fmt.Sprintf("is %s", tfdiags.CompactValueStr(val))
 						}
 						values = append(values, value)
 						seen[traversalStr] = struct{}{}
@@ -403,111 +436,4 @@ func parseRange(src []byte, rng hcl.Range) (*hcl.File, int) {
 	}
 
 	return file, offset
-}
-
-// compactValueStr produces a compact, single-line summary of a given value
-// that is suitable for display in the UI.
-//
-// For primitives it returns a full representation, while for more complex
-// types it instead summarizes the type, size, etc to produce something
-// that is hopefully still somewhat useful but not as verbose as a rendering
-// of the entire data structure.
-func compactValueStr(val cty.Value) string {
-	// This is a specialized subset of value rendering tailored to producing
-	// helpful but concise messages in diagnostics. It is not comprehensive
-	// nor intended to be used for other purposes.
-
-	if val.HasMark(marks.Sensitive) {
-		// We check this in here just to make sure, but note that the caller
-		// of compactValueStr ought to have already checked this and skipped
-		// calling into compactValueStr anyway, so this shouldn't actually
-		// be reachable.
-		return "(sensitive value)"
-	}
-
-	// WARNING: We've only checked that the value isn't sensitive _shallowly_
-	// here, and so we must never show any element values from complex types
-	// in here. However, it's fine to show map keys and attribute names because
-	// those are never sensitive in isolation: the entire value would be
-	// sensitive in that case.
-
-	ty := val.Type()
-	switch {
-	case val.IsNull():
-		return "null"
-	case !val.IsKnown():
-		// Should never happen here because we should filter before we get
-		// in here, but we'll do something reasonable rather than panic.
-		return "(not yet known)"
-	case ty == cty.Bool:
-		if val.True() {
-			return "true"
-		}
-		return "false"
-	case ty == cty.Number:
-		bf := val.AsBigFloat()
-		return bf.Text('g', 10)
-	case ty == cty.String:
-		// Go string syntax is not exactly the same as HCL native string syntax,
-		// but we'll accept the minor edge-cases where this is different here
-		// for now, just to get something reasonable here.
-		return fmt.Sprintf("%q", val.AsString())
-	case ty.IsCollectionType() || ty.IsTupleType():
-		l := val.LengthInt()
-		switch l {
-		case 0:
-			return "empty " + ty.FriendlyName()
-		case 1:
-			return ty.FriendlyName() + " with 1 element"
-		default:
-			return fmt.Sprintf("%s with %d elements", ty.FriendlyName(), l)
-		}
-	case ty.IsObjectType():
-		atys := ty.AttributeTypes()
-		l := len(atys)
-		switch l {
-		case 0:
-			return "object with no attributes"
-		case 1:
-			var name string
-			for k := range atys {
-				name = k
-			}
-			return fmt.Sprintf("object with 1 attribute %q", name)
-		default:
-			return fmt.Sprintf("object with %d attributes", l)
-		}
-	default:
-		return ty.FriendlyName()
-	}
-}
-
-// traversalStr produces a representation of an HCL traversal that is compact,
-// resembles HCL native syntax, and is suitable for display in the UI.
-func traversalStr(traversal hcl.Traversal) string {
-	// This is a specialized subset of traversal rendering tailored to
-	// producing helpful contextual messages in diagnostics. It is not
-	// comprehensive nor intended to be used for other purposes.
-
-	var buf bytes.Buffer
-	for _, step := range traversal {
-		switch tStep := step.(type) {
-		case hcl.TraverseRoot:
-			buf.WriteString(tStep.Name)
-		case hcl.TraverseAttr:
-			buf.WriteByte('.')
-			buf.WriteString(tStep.Name)
-		case hcl.TraverseIndex:
-			buf.WriteByte('[')
-			if keyTy := tStep.Key.Type(); keyTy.IsPrimitiveType() {
-				buf.WriteString(compactValueStr(tStep.Key))
-			} else {
-				// We'll just use a placeholder for more complex values,
-				// since otherwise our result could grow ridiculously long.
-				buf.WriteString("...")
-			}
-			buf.WriteByte(']')
-		}
-	}
-	return buf.String()
 }

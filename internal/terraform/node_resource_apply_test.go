@@ -17,7 +17,7 @@ func TestNodeExpandApplyableResourceExecute(t *testing.T) {
 	t.Run("no config", func(t *testing.T) {
 		ctx := &MockEvalContext{
 			StateState:               state.SyncWrapper(),
-			InstanceExpanderExpander: instances.NewExpander(),
+			InstanceExpanderExpander: instances.NewExpander(nil),
 		}
 
 		node := &nodeExpandApplyableResource{
@@ -26,7 +26,7 @@ func TestNodeExpandApplyableResourceExecute(t *testing.T) {
 				Config: nil,
 			},
 		}
-		diags := node.Execute(ctx, walkApply)
+		_, diags := node.DynamicExpand(ctx)
 		if diags.HasErrors() {
 			t.Fatalf("unexpected error: %s", diags.Err())
 		}
@@ -40,7 +40,7 @@ func TestNodeExpandApplyableResourceExecute(t *testing.T) {
 	t.Run("simple", func(t *testing.T) {
 		ctx := &MockEvalContext{
 			StateState:               state.SyncWrapper(),
-			InstanceExpanderExpander: instances.NewExpander(),
+			InstanceExpanderExpander: instances.NewExpander(nil),
 		}
 
 		node := &nodeExpandApplyableResource{
@@ -57,10 +57,11 @@ func TestNodeExpandApplyableResourceExecute(t *testing.T) {
 				},
 			},
 		}
-		diags := node.Execute(ctx, walkApply)
+		_, diags := node.DynamicExpand(ctx)
 		if diags.HasErrors() {
 			t.Fatalf("unexpected error: %s", diags.Err())
 		}
+
 		if state.Empty() {
 			t.Fatal("expected resources in state, got empty state")
 		}

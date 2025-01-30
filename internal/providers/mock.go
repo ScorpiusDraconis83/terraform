@@ -30,6 +30,9 @@ var _ Interface = (*Mock)(nil)
 // data to return for any computed fields within the provider schema. The
 // provider will make up random / junk data for any computed fields for which
 // preset data is not available.
+//
+// This is distinct from the testing.MockProvider, which is a mock provider
+// that is used by the Terraform core itself to test it's own behavior.
 type Mock struct {
 	Provider Interface
 	Data     *configs.MockData
@@ -41,6 +44,23 @@ func (m *Mock) GetProviderSchema() GetProviderSchemaResponse {
 	if m.schema == nil {
 		// Cache the schema, it's not changing.
 		schema := m.Provider.GetProviderSchema()
+
+		// Override the provider schema with the constant mock provider schema.
+		// This is empty at the moment, check configs/mock_provider.go for the
+		// actual schema.
+		//
+		// The GetProviderSchemaResponse is returned by value, so it should be
+		// safe for us to modify directly, without affecting any shared state
+		// that could be in use elsewhere.
+		schema.Provider = Schema{
+			Version: schema.Provider.Version,
+			Block:   nil, // Empty - we support no blocks or attributes in mock provider configurations.
+		}
+
+		// Note, we leave the resource and data source schemas as they are since
+		// we want to be able to validate those configurations against the real
+		// provider schemas.
+
 		m.schema = &schema
 	}
 	return *m.schema
@@ -162,7 +182,18 @@ func (m *Mock) PlanResourceChange(request PlanResourceChangeRequest) PlanResourc
 			panic(fmt.Errorf("failed to retrieve schema for resource %s", request.TypeName))
 		}
 
-		value, diags := mocking.PlanComputedValuesForResource(request.ProposedNewState, resource.Block)
+		replacement := &mocking.MockedData{
+			Value:             cty.NilVal, // If we have no data then we use cty.NilVal.
+			ComputedAsUnknown: true,
+		}
+		// if we are allowed to use the mock defaults for plan, we can populate the computed fields with the mock defaults.
+		if mockedResource, exists := m.Data.MockResources[request.TypeName]; exists && mockedResource.UseForPlan {
+			replacement.Value = mockedResource.Defaults
+			replacement.Range = mockedResource.DefaultsRange
+			replacement.ComputedAsUnknown = false
+		}
+
+		value, diags := mocking.PlanComputedValuesForResource(request.ProposedNewState, replacement, resource.Block)
 		response.Diagnostics = response.Diagnostics.Append(diags)
 		response.PlannedState = value
 		response.PlannedPrivate = []byte("create")
@@ -200,7 +231,7 @@ func (m *Mock) ApplyResourceChange(request ApplyResourceChangeRequest) ApplyReso
 			panic(fmt.Errorf("failed to retrieve schema for resource %s", request.TypeName))
 		}
 
-		replacement := mocking.MockedData{
+		replacement := &mocking.MockedData{
 			Value: cty.NilVal, // If we have no data then we use cty.NilVal.
 		}
 		if mockedResource, exists := m.Data.MockResources[request.TypeName]; exists {
@@ -231,6 +262,12 @@ func (m *Mock) ImportResourceState(request ImportResourceStateRequest) (response
 	return response
 }
 
+func (m *Mock) MoveResourceState(request MoveResourceStateRequest) MoveResourceStateResponse {
+	// The MoveResourceState operation happens offline, so we can just hand this
+	// off to the underlying provider.
+	return m.Provider.MoveResourceState(request)
+}
+
 func (m *Mock) ReadDataSource(request ReadDataSourceRequest) ReadDataSourceResponse {
 	var response ReadDataSourceResponse
 
@@ -249,7 +286,7 @@ func (m *Mock) ReadDataSource(request ReadDataSourceRequest) ReadDataSourceRespo
 		panic(fmt.Errorf("failed to retrieve schema for data source %s", request.TypeName))
 	}
 
-	mockedData := mocking.MockedData{
+	mockedData := &mocking.MockedData{
 		Value: cty.NilVal, // If we have no mocked data we use cty.NilVal.
 	}
 	if mockedDataSource, exists := m.Data.MockDataSources[request.TypeName]; exists {
@@ -261,6 +298,61 @@ func (m *Mock) ReadDataSource(request ReadDataSourceRequest) ReadDataSourceRespo
 	response.Diagnostics = response.Diagnostics.Append(diags)
 	response.State = value
 	return response
+}
+
+func (m *Mock) ValidateEphemeralResourceConfig(ValidateEphemeralResourceConfigRequest) ValidateEphemeralResourceConfigResponse {
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"No ephemeral resource types in mock providers",
+		"The provider mocking mechanism does not yet support ephemeral resource types.",
+		nil, // the topmost configuration object
+	))
+	return ValidateEphemeralResourceConfigResponse{
+		Diagnostics: diags,
+	}
+}
+
+func (m *Mock) OpenEphemeralResource(OpenEphemeralResourceRequest) OpenEphemeralResourceResponse {
+	// FIXME: Design some means to mock an ephemeral resource type.
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"No ephemeral resource types in mock providers",
+		"The provider mocking mechanism does not yet support ephemeral resource types.",
+		nil, // the topmost configuration object
+	))
+	return OpenEphemeralResourceResponse{
+		Diagnostics: diags,
+	}
+}
+
+func (m *Mock) RenewEphemeralResource(RenewEphemeralResourceRequest) RenewEphemeralResourceResponse {
+	// FIXME: Design some means to mock an ephemeral resource type.
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"No ephemeral resource types in mock providers",
+		"The provider mocking mechanism does not yet support ephemeral resource types.",
+		nil, // the topmost configuration object
+	))
+	return RenewEphemeralResourceResponse{
+		Diagnostics: diags,
+	}
+}
+
+func (m *Mock) CloseEphemeralResource(CloseEphemeralResourceRequest) CloseEphemeralResourceResponse {
+	// FIXME: Design some means to mock an ephemeral resource type.
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"No ephemeral resource types in mock providers",
+		"The provider mocking mechanism does not yet support ephemeral resource types.",
+		nil, // the topmost configuration object
+	))
+	return CloseEphemeralResourceResponse{
+		Diagnostics: diags,
+	}
 }
 
 func (m *Mock) CallFunction(request CallFunctionRequest) CallFunctionResponse {
