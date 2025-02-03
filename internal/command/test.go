@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform/internal/cloud"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/command/jsonformat"
+	"github.com/hashicorp/terraform/internal/command/junit"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/moduletest"
@@ -27,13 +28,13 @@ func (c *TestCommand) Help() string {
 	helpText := `
 Usage: terraform [global options] test [options]
 
-  Executes automated integration tests against the current Terraform 
+  Executes automated integration tests against the current Terraform
   configuration.
 
-  Terraform will search for .tftest.hcl files within the current configuration 
-  and testing directories. Terraform will then execute the testing run blocks 
-  within any testing files in order, and verify conditional checks and 
-  assertions against the created infrastructure. 
+  Terraform will search for .tftest.hcl files within the current configuration
+  and testing directories. Terraform will then execute the testing run blocks
+  within any testing files in order, and verify conditional checks and
+  assertions against the created infrastructure.
 
   This command creates real infrastructure and will attempt to clean up the
   testing infrastructure on completion. Monitor the output carefully to ensure
@@ -42,11 +43,12 @@ Usage: terraform [global options] test [options]
 Options:
 
   -cloud-run=source     If specified, Terraform will execute this test run 
-                        remotely using Terraform Cloud. You must specify the 
-                        source of a module registered in a private module
-                        registry as the argument to this flag. This allows 
-                        Terraform to associate the cloud run with the correct 
-                        Terraform Cloud module and organization.
+                        remotely using HCP Terraform or Terraform Enterprise. 
+						You must specify the source of a module registered in 
+						a private module registry as the argument to this flag. 
+						This allows Terraform to associate the cloud run with 
+						the correct HCP Terraform or Terraform Enterprise module 
+						and organization.
 
   -filter=testfile      If specified, Terraform will only execute the test files
                         specified by this flag. You can use this option multiple
@@ -57,7 +59,7 @@ Options:
 
   -no-color             If specified, output won't contain any color.
 
-  -test-directory=path	Set the Terraform test directory, defaults to "tests".    
+  -test-directory=path	Set the Terraform test directory, defaults to "tests".
 
   -var 'foo=bar'        Set a value for one of the input variables in the root
                         module of the configuration. Use this option more than
@@ -101,7 +103,7 @@ func (c *TestCommand) Run(rawArgs []string) int {
 	view := views.NewTest(args.ViewType, c.View)
 
 	// The specified testing directory must be a relative path, and it must
-	// point to a directory that is a descendent of the configuration directory.
+	// point to a directory that is a descendant of the configuration directory.
 	if !filepath.IsLocal(args.TestDirectory) {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
@@ -121,14 +123,14 @@ func (c *TestCommand) Run(rawArgs []string) int {
 
 	// Users can also specify variables via the command line, so we'll parse
 	// all that here.
-	var items []rawFlag
+	var items []arguments.FlagNameValue
 	for _, variable := range args.Vars.All() {
-		items = append(items, rawFlag{
+		items = append(items, arguments.FlagNameValue{
 			Name:  variable.Name,
 			Value: variable.Value,
 		})
 	}
-	c.variableArgs = rawFlags{items: &items}
+	c.variableArgs = arguments.FlagNameValueSlice{Items: &items}
 
 	// Collect variables for "terraform test"
 	testVariables, variableDiags := c.collectVariableValuesForTests(args.TestDirectory)
@@ -198,7 +200,7 @@ func (c *TestCommand) Run(rawArgs []string) int {
 			Streams:          c.Streams,
 		}
 	} else {
-		runner = &local.TestSuiteRunner{
+		localRunner := &local.TestSuiteRunner{
 			Config: config,
 			// The GlobalVariables are loaded from the
 			// main configuration directory
@@ -216,6 +218,14 @@ func (c *TestCommand) Run(rawArgs []string) int {
 			Filter:              args.Filter,
 			Verbose:             args.Verbose,
 		}
+
+		// JUnit output is only compatible with local test execution
+		if args.JUnitXMLFile != "" {
+			// Make sure TestCommand's calls loadConfigWithTests before this code, so configLoader is not nil
+			localRunner.JUnit = junit.NewTestJUnitXMLFile(args.JUnitXMLFile, c.configLoader, localRunner)
+		}
+
+		runner = localRunner
 	}
 
 	var testDiags tfdiags.Diagnostics

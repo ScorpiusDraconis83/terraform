@@ -5,7 +5,7 @@ package stackeval
 
 import (
 	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/states"
 )
 
@@ -23,16 +23,25 @@ type ComponentInstanceApplyResult struct {
 	// during plan, even though no external actions were taken during the
 	// apply phase.
 	AffectedResourceInstanceObjects addrs.Set[addrs.AbsResourceInstanceObject]
+
+	// Complete is set to true if the apply ran to completion successfully
+	// such that it should be safe to try to apply other component instances
+	// that are awaiting the completion of this one.
+	//
+	// If set to false, some changes may have been made but there may be
+	// some changes still pending and so other waiting component instances
+	// should not try to apply themselves at all.
+	Complete bool
 }
 
-// resourceInstanceObjectsAffectedByPlan finds an exhaustive set of addresses
-// for all resource instance objects that could potentially have their state
-// changed while applying the given plan.
+// resourceInstanceObjectsAffectedByStackPlan finds an exhaustive set of
+// addresses for all resource instance objects that could potentially have their
+// state changed while applying the given plan.
 //
 // Along with the objects targeted by explicit planned changes, this also
 // includes objects whose state might just get updated to capture changes
 // made outside of Terraform that were detected during the planning phase.
-func resourceInstanceObjectsAffectedByPlan(plan *plans.Plan) addrs.Set[addrs.AbsResourceInstanceObject] {
+func resourceInstanceObjectsAffectedByStackPlan(plan *stackplan.Component) addrs.Set[addrs.AbsResourceInstanceObject] {
 	// For now we conservatively just enumerate everything that exists
 	// either before or after the change. This is technically more than
 	// we strictly need to return -- it will include objects that have
@@ -41,19 +50,14 @@ func resourceInstanceObjectsAffectedByPlan(plan *plans.Plan) addrs.Set[addrs.Abs
 	// will cause stale objects to get left in the state.
 
 	ret := addrs.MakeSet[addrs.AbsResourceInstanceObject]()
-	if plan.Changes != nil {
-		for _, ch := range plan.Changes.Resources {
-			ret.Add(ch.ObjectAddr())
+	if plan.ResourceInstancePlanned.Len() > 0 {
+		for _, ch := range plan.ResourceInstancePlanned.Elems {
+			ret.Add(ch.Key)
 		}
 	}
-	if plan.PriorState != nil {
-		for _, addr := range plan.PriorState.AllResourceInstanceObjectAddrs() {
-			ret.Add(addr)
-		}
-	}
-	if plan.PrevRunState != nil {
-		for _, addr := range plan.PrevRunState.AllResourceInstanceObjectAddrs() {
-			ret.Add(addr)
+	if plan.ResourceInstancePriorState.Len() > 0 {
+		for _, addr := range plan.ResourceInstancePriorState.Elems {
+			ret.Add(addr.Key)
 		}
 	}
 	return ret

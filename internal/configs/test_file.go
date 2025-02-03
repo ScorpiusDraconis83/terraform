@@ -8,9 +8,10 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 
 	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/getmodules"
+	"github.com/hashicorp/terraform/internal/getmodules/moduleaddrs"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -131,6 +132,8 @@ type TestRun struct {
 	// to report a failure from their custom conditions as part of this test
 	// run.
 	ExpectFailures []hcl.Traversal
+
+	StateKey string
 
 	NameDeclRange      hcl.Range
 	VariablesDeclRange hcl.Range
@@ -336,7 +339,7 @@ func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
 				tf.Variables[v.Name] = v.Expr
 			}
 		case "provider":
-			provider, providerDiags := decodeProviderBlock(block)
+			provider, providerDiags := decodeProviderBlock(block, true)
 			diags = append(diags, providerDiags...)
 			if provider != nil {
 				key := provider.moduleUniqueKey()
@@ -368,7 +371,7 @@ func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
 				tf.Providers[key] = provider
 			}
 		case "override_resource":
-			override, overrideDiags := decodeOverrideResourceBlock(block, TestFileOverrideSource)
+			override, overrideDiags := decodeOverrideResourceBlock(block, false, TestFileOverrideSource)
 			diags = append(diags, overrideDiags...)
 
 			if override != nil && override.Target != nil {
@@ -385,7 +388,7 @@ func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
 				tf.Overrides.Put(subject, override)
 			}
 		case "override_data":
-			override, overrideDiags := decodeOverrideDataBlock(block, TestFileOverrideSource)
+			override, overrideDiags := decodeOverrideDataBlock(block, false, TestFileOverrideSource)
 			diags = append(diags, overrideDiags...)
 
 			if override != nil && override.Target != nil {
@@ -402,7 +405,7 @@ func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
 				tf.Overrides.Put(subject, override)
 			}
 		case "override_module":
-			override, overrideDiags := decodeOverrideModuleBlock(block, TestFileOverrideSource)
+			override, overrideDiags := decodeOverrideModuleBlock(block, false, TestFileOverrideSource)
 			diags = append(diags, overrideDiags...)
 
 			if override != nil && override.Target != nil {
@@ -437,6 +440,16 @@ func decodeTestRunBlock(block *hcl.Block) (*TestRun, hcl.Diagnostics) {
 		NameDeclRange: block.LabelRanges[0],
 		DeclRange:     block.DefRange,
 	}
+
+	if !hclsyntax.ValidIdentifier(r.Name) {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid run block name",
+			Detail:   badIdentifierDetail,
+			Subject:  r.NameDeclRange.Ptr(),
+		})
+	}
+
 	for _, block := range content.Blocks {
 		switch block.Type {
 		case "assert":
@@ -496,7 +509,7 @@ func decodeTestRunBlock(block *hcl.Block) (*TestRun, hcl.Diagnostics) {
 				r.Module = module
 			}
 		case "override_resource":
-			override, overrideDiags := decodeOverrideResourceBlock(block, RunBlockOverrideSource)
+			override, overrideDiags := decodeOverrideResourceBlock(block, false, RunBlockOverrideSource)
 			diags = append(diags, overrideDiags...)
 
 			if override != nil && override.Target != nil {
@@ -513,7 +526,7 @@ func decodeTestRunBlock(block *hcl.Block) (*TestRun, hcl.Diagnostics) {
 				r.Overrides.Put(subject, override)
 			}
 		case "override_data":
-			override, overrideDiags := decodeOverrideDataBlock(block, RunBlockOverrideSource)
+			override, overrideDiags := decodeOverrideDataBlock(block, false, RunBlockOverrideSource)
 			diags = append(diags, overrideDiags...)
 
 			if override != nil && override.Target != nil {
@@ -530,7 +543,7 @@ func decodeTestRunBlock(block *hcl.Block) (*TestRun, hcl.Diagnostics) {
 				r.Overrides.Put(subject, override)
 			}
 		case "override_module":
-			override, overrideDiags := decodeOverrideModuleBlock(block, RunBlockOverrideSource)
+			override, overrideDiags := decodeOverrideModuleBlock(block, false, RunBlockOverrideSource)
 			diags = append(diags, overrideDiags...)
 
 			if override != nil && override.Target != nil {
@@ -590,9 +603,14 @@ func decodeTestRunBlock(block *hcl.Block) (*TestRun, hcl.Diagnostics) {
 	}
 
 	if attr, exists := content.Attributes["expect_failures"]; exists {
-		failures, failDiags := decodeDependsOn(attr)
+		failures, failDiags := DecodeDependsOn(attr)
 		diags = append(diags, failDiags...)
 		r.ExpectFailures = failures
+	}
+
+	if attr, exists := content.Attributes["state_key"]; exists {
+		rawDiags := gohcl.DecodeExpression(attr.Expr, nil, &r.StateKey)
+		diags = append(diags, rawDiags...)
 	}
 
 	return &r, diags
@@ -625,9 +643,9 @@ func decodeTestRunModuleBlock(block *hcl.Block) (*TestRunModuleCall, hcl.Diagnos
 		if !rawDiags.HasErrors() {
 			var err error
 			if haveVersionArg {
-				module.Source, err = addrs.ParseModuleSourceRegistry(raw)
+				module.Source, err = moduleaddrs.ParseModuleSourceRegistry(raw)
 			} else {
-				module.Source, err = addrs.ParseModuleSource(raw)
+				module.Source, err = moduleaddrs.ParseModuleSource(raw)
 			}
 			if err != nil {
 				// NOTE: We leave mc.SourceAddr as nil for any situation where the
@@ -644,7 +662,7 @@ func decodeTestRunModuleBlock(block *hcl.Block) (*TestRunModuleCall, hcl.Diagnos
 				// though, mostly related to remote package sub-paths and local
 				// paths.
 				switch err := err.(type) {
-				case *getmodules.MaybeRelativePathErr:
+				case *moduleaddrs.MaybeRelativePathErr:
 					diags = append(diags, &hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Invalid module source address",
@@ -738,13 +756,13 @@ func decodeTestRunOptionsBlock(block *hcl.Block) (*TestRunOptions, hcl.Diagnosti
 	}
 
 	if attr, exists := content.Attributes["replace"]; exists {
-		reps, repsDiags := decodeDependsOn(attr)
+		reps, repsDiags := DecodeDependsOn(attr)
 		diags = append(diags, repsDiags...)
 		opts.Replace = reps
 	}
 
 	if attr, exists := content.Attributes["target"]; exists {
-		tars, tarsDiags := decodeDependsOn(attr)
+		tars, tarsDiags := DecodeDependsOn(attr)
 		diags = append(diags, tarsDiags...)
 		opts.Target = tars
 	}
@@ -796,6 +814,7 @@ var testRunBlockSchema = &hcl.BodySchema{
 		{Name: "command"},
 		{Name: "providers"},
 		{Name: "expect_failures"},
+		{Name: "state_key"},
 	},
 	Blocks: []hcl.BlockHeaderSchema{
 		{

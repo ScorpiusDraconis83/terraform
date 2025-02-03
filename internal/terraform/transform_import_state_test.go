@@ -30,8 +30,23 @@ func TestGraphNodeImportStateExecute(t *testing.T) {
 	provider.ConfigureProvider(providers.ConfigureProviderRequest{})
 
 	ctx := &MockEvalContext{
+		Scope:            evalContextModuleInstance{Addr: addrs.RootModuleInstance},
 		StateState:       state.SyncWrapper(),
 		ProviderProvider: provider,
+		ProviderSchemaSchema: providers.GetProviderSchemaResponse{
+			ResourceTypes: map[string]providers.Schema{
+				"aws_instance": {
+					Block: &configschema.Block{
+						Attributes: map[string]*configschema.Attribute{
+							"id": {
+								Type:     cty.String,
+								Required: true,
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	// Import a new aws_instance.foo, this time with ID=bar. The original

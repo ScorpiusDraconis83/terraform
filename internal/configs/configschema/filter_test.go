@@ -175,6 +175,12 @@ func TestFilter(t *testing.T) {
 							Nesting: NestingList,
 						},
 					},
+					"missing_attributes": {
+						NestedType: &Object{
+							Nesting: NestingList,
+						},
+						Computed: true,
+					},
 				},
 
 				BlockTypes: map[string]*NestedBlock{
@@ -272,9 +278,16 @@ func TestFilter(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			original := tc.schema.DeepCopy()
+
 			got := tc.schema.Filter(tc.filterAttribute, tc.filterBlock)
 			if !cmp.Equal(got, tc.want, cmp.Comparer(cty.Type.Equals), cmpopts.EquateEmpty()) {
-				t.Fatal(cmp.Diff(got, tc.want, cmp.Comparer(cty.Type.Equals), cmpopts.EquateEmpty()))
+				t.Error(cmp.Diff(got, tc.want, cmp.Comparer(cty.Type.Equals), cmpopts.EquateEmpty()))
+			}
+
+			// We shouldn't have edited the original schema.
+			if !cmp.Equal(tc.schema, original, cmp.Comparer(cty.Type.Equals), cmpopts.EquateEmpty()) {
+				t.Errorf("the original schema was edited when it shouldn't have been: %s", cmp.Diff(tc.schema, original, cmp.Comparer(cty.Type.Equals), cmpopts.EquateEmpty()))
 			}
 		})
 	}

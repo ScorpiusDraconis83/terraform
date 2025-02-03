@@ -11,7 +11,7 @@ import (
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/dag"
-	"github.com/hashicorp/terraform/internal/lang"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -55,7 +55,11 @@ type NodeAbstractResource struct {
 
 	Schema        *configschema.Block // Schema for processing the configuration body
 	SchemaVersion uint64              // Schema version of "Schema", as decided by the provider
-	Config        *configs.Resource   // Config is the resource in the config
+
+	// Config and RemovedConfig are mutally-exclusive, because a
+	// resource can't be both declared and removed at the same time.
+	Config        *configs.Resource // Config is the resource in the config, if any
+	RemovedConfig *configs.Removed  // RemovedConfig is the "removed" block for this resource, if any
 
 	// ProviderMetas is the provider_meta configs for the module this resource belongs to
 	ProviderMetas map[addrs.Provider]*configs.ProviderMeta
@@ -66,8 +70,7 @@ type NodeAbstractResource struct {
 	Targets []addrs.Targetable
 
 	// Set from AttachDataResourceDependsOn
-	dependsOn      []addrs.ConfigResource
-	forceDependsOn bool
+	dependsOn []addrs.ConfigResource
 
 	// The address of the provider this resource will use
 	ResolvedProvider addrs.AbsProviderConfig
@@ -82,6 +85,8 @@ type NodeAbstractResource struct {
 	// generateConfigPath tells this node which file to write generated config
 	// into. If empty, then config should not be generated.
 	generateConfigPath string
+
+	forceCreateBeforeDestroy bool
 }
 
 var (
@@ -98,6 +103,7 @@ var (
 	_ GraphNodeTargetable                  = (*NodeAbstractResource)(nil)
 	_ graphNodeAttachDataResourceDependsOn = (*NodeAbstractResource)(nil)
 	_ dag.GraphNodeDotter                  = (*NodeAbstractResource)(nil)
+	_ GraphNodeDestroyerCBD                = (*NodeAbstractResource)(nil)
 )
 
 // NewNodeAbstractResource creates an abstract resource graph node for
@@ -140,6 +146,24 @@ func (n *NodeAbstractResource) ReferenceableAddrs() []addrs.Referenceable {
 	return []addrs.Referenceable{n.Addr.Resource}
 }
 
+// CreateBeforeDestroy returns this node's CreateBeforeDestroy status.
+func (n *NodeAbstractResource) CreateBeforeDestroy() bool {
+	if n.forceCreateBeforeDestroy {
+		return n.forceCreateBeforeDestroy
+	}
+
+	if n.Config != nil && n.Config.Managed != nil {
+		return n.Config.Managed.CreateBeforeDestroy
+	}
+
+	return false
+}
+
+func (n *NodeAbstractResource) ModifyCreateBeforeDestroy(v bool) error {
+	n.forceCreateBeforeDestroy = v
+	return nil
+}
+
 // GraphNodeReferencer
 func (n *NodeAbstractResource) References() []*addrs.Reference {
 	var result []*addrs.Reference
@@ -153,25 +177,25 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 			log.Printf("[WARN] no schema is attached to %s, so config references cannot be detected", n.Name())
 		}
 
-		refs, _ := lang.ReferencesInExpr(addrs.ParseRef, c.Count)
+		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, c.Count)
 		result = append(result, refs...)
-		refs, _ = lang.ReferencesInExpr(addrs.ParseRef, c.ForEach)
+		refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, c.ForEach)
 		result = append(result, refs...)
 
 		for _, expr := range c.TriggersReplacement {
-			refs, _ = lang.ReferencesInExpr(addrs.ParseRef, expr)
+			refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, expr)
 			result = append(result, refs...)
 		}
 
 		// ReferencesInBlock() requires a schema
 		if n.Schema != nil {
-			refs, _ = lang.ReferencesInBlock(addrs.ParseRef, c.Config, n.Schema)
+			refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, c.Config, n.Schema)
 			result = append(result, refs...)
 		}
 
 		if c.Managed != nil {
 			if c.Managed.Connection != nil {
-				refs, _ = lang.ReferencesInBlock(addrs.ParseRef, c.Managed.Connection.Config, connectionBlockSupersetSchema)
+				refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, c.Managed.Connection.Config, connectionBlockSupersetSchema)
 				result = append(result, refs...)
 			}
 
@@ -180,7 +204,7 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 					continue
 				}
 				if p.Connection != nil {
-					refs, _ = lang.ReferencesInBlock(addrs.ParseRef, p.Connection.Config, connectionBlockSupersetSchema)
+					refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, p.Connection.Config, connectionBlockSupersetSchema)
 					result = append(result, refs...)
 				}
 
@@ -188,21 +212,21 @@ func (n *NodeAbstractResource) References() []*addrs.Reference {
 				if schema == nil {
 					log.Printf("[WARN] no schema for provisioner %q is attached to %s, so provisioner block references cannot be detected", p.Type, n.Name())
 				}
-				refs, _ = lang.ReferencesInBlock(addrs.ParseRef, p.Config, schema)
+				refs, _ = langrefs.ReferencesInBlock(addrs.ParseRef, p.Config, schema)
 				result = append(result, refs...)
 			}
 		}
 
 		for _, check := range c.Preconditions {
-			refs, _ := lang.ReferencesInExpr(addrs.ParseRef, check.Condition)
+			refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, check.Condition)
 			result = append(result, refs...)
-			refs, _ = lang.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
+			refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
 			result = append(result, refs...)
 		}
 		for _, check := range c.Postconditions {
-			refs, _ := lang.ReferencesInExpr(addrs.ParseRef, check.Condition)
+			refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, check.Condition)
 			result = append(result, refs...)
-			refs, _ = lang.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
+			refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, check.ErrorMessage)
 			result = append(result, refs...)
 		}
 	}
@@ -218,9 +242,9 @@ func (n *NodeAbstractResource) ImportReferences() []*addrs.Reference {
 			continue
 		}
 
-		refs, _ := lang.ReferencesInExpr(addrs.ParseRef, importTarget.Config.ID)
+		refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, importTarget.Config.ID)
 		result = append(result, refs...)
-		refs, _ = lang.ReferencesInExpr(addrs.ParseRef, importTarget.Config.ForEach)
+		refs, _ = langrefs.ReferencesInExpr(addrs.ParseRef, importTarget.Config.ForEach)
 		result = append(result, refs...)
 	}
 	return result
@@ -353,14 +377,14 @@ func (n *NodeAbstractResource) SetTargets(targets []addrs.Targetable) {
 }
 
 // graphNodeAttachDataResourceDependsOn
-func (n *NodeAbstractResource) AttachDataResourceDependsOn(deps []addrs.ConfigResource, force bool) {
+func (n *NodeAbstractResource) AttachDataResourceDependsOn(deps []addrs.ConfigResource) {
 	n.dependsOn = deps
-	n.forceDependsOn = force
 }
 
 // GraphNodeAttachResourceConfig
-func (n *NodeAbstractResource) AttachResourceConfig(c *configs.Resource) {
+func (n *NodeAbstractResource) AttachResourceConfig(c *configs.Resource, rc *configs.Removed) {
 	n.Config = c
+	n.RemovedConfig = rc
 }
 
 // GraphNodeAttachResourceSchema impl
@@ -385,16 +409,10 @@ func (n *NodeAbstractResource) DotNode(name string, opts *dag.DotOpts) *dag.DotN
 	}
 }
 
-// writeResourceState ensures that a suitable resource-level state record is
-// present in the state, if that's required for the "each mode" of that
-// resource.
-//
-// This is important primarily for the situation where count = 0, since this
-// eval is the only change we get to set the resource "each mode" to list
-// in that case, allowing expression evaluation to see it as a zero-element list
-// rather than as not set at all.
-func (n *NodeAbstractResource) writeResourceState(ctx EvalContext, addr addrs.AbsResource) (diags tfdiags.Diagnostics) {
-	state := ctx.State()
+// recordResourceData records some metadata for the resource as a whole in
+// various locations. This currently includes adding resource expansion info to
+// the instance expander, and recording the provider used in the state.
+func (n *NodeAbstractResource) recordResourceData(ctx EvalContext, addr addrs.AbsResource) (diags tfdiags.Diagnostics) {
 
 	// We'll record our expansion decision in the shared "expander" object
 	// so that later operations (i.e. DynamicExpand and expression evaluation)
@@ -402,19 +420,30 @@ func (n *NodeAbstractResource) writeResourceState(ctx EvalContext, addr addrs.Ab
 	// to expand the module here to create all resources.
 	expander := ctx.InstanceExpander()
 
+	// Allowing unknown values in count and for_each is a top-level plan option.
+	//
+	// If this is false then the codepaths that handle unknown values below
+	// become unreachable, because the evaluate functions will reject unknown
+	// values as an error.
+	allowUnknown := ctx.Deferrals().DeferralAllowed()
+
 	switch {
 	case n.Config != nil && n.Config.Count != nil:
-		count, countDiags := evaluateCountExpression(n.Config.Count, ctx)
+		count, countDiags := evaluateCountExpression(n.Config.Count, ctx, allowUnknown)
 		diags = diags.Append(countDiags)
 		if countDiags.HasErrors() {
 			return diags
 		}
 
-		state.SetResourceProvider(addr, n.ResolvedProvider)
-		expander.SetResourceCount(addr.Module, n.Addr.Resource, count)
+		if count >= 0 {
+			expander.SetResourceCount(addr.Module, n.Addr.Resource, count)
+		} else {
+			// -1 represents "unknown"
+			expander.SetResourceCountUnknown(addr.Module, n.Addr.Resource)
+		}
 
 	case n.Config != nil && n.Config.ForEach != nil:
-		forEach, forEachDiags := evaluateForEachExpression(n.Config.ForEach, ctx)
+		forEach, known, forEachDiags := evaluateForEachExpression(n.Config.ForEach, ctx, allowUnknown)
 		diags = diags.Append(forEachDiags)
 		if forEachDiags.HasErrors() {
 			return diags
@@ -422,13 +451,23 @@ func (n *NodeAbstractResource) writeResourceState(ctx EvalContext, addr addrs.Ab
 
 		// This method takes care of all of the business logic of updating this
 		// while ensuring that any existing instances are preserved, etc.
-		state.SetResourceProvider(addr, n.ResolvedProvider)
-		expander.SetResourceForEach(addr.Module, n.Addr.Resource, forEach)
+		if known {
+			expander.SetResourceForEach(addr.Module, n.Addr.Resource, forEach)
+		} else {
+			expander.SetResourceForEachUnknown(addr.Module, n.Addr.Resource)
+		}
 
 	default:
-		state.SetResourceProvider(addr, n.ResolvedProvider)
 		expander.SetResourceSingle(addr.Module, n.Addr.Resource)
 	}
+
+	if addr.Resource.Mode == addrs.EphemeralResourceMode {
+		// ephemeral resources are not included in the state
+		return diags
+	}
+
+	state := ctx.State()
+	state.SetResourceProvider(addr, n.ResolvedProvider)
 
 	return diags
 }

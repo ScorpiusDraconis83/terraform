@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform/internal/initwd"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
+	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/registry"
 	"github.com/hashicorp/terraform/internal/states"
@@ -88,7 +89,7 @@ func testModuleWithSnapshot(t *testing.T, name string) (*configs.Config, *config
 
 // testModuleInline takes a map of path -> config strings and yields a config
 // structure with those files loaded from disk
-func testModuleInline(t *testing.T, sources map[string]string) *configs.Config {
+func testModuleInline(t testing.TB, sources map[string]string) *configs.Config {
 	t.Helper()
 
 	cfgPath := t.TempDir()
@@ -170,7 +171,7 @@ func testSetResourceInstanceTainted(module *states.Module, resource, attrsJson, 
 }
 
 func testProviderFuncFixed(rp providers.Interface) providers.Factory {
-	if p, ok := rp.(*MockProvider); ok {
+	if p, ok := rp.(*testing_provider.MockProvider); ok {
 		// make sure none of the methods were "called" on this new instance
 		p.GetProviderSchemaCalled = false
 		p.ValidateProviderConfigCalled = false
@@ -225,6 +226,14 @@ func mustAbsResourceAddr(s string) addrs.AbsResource {
 	return addr
 }
 
+func mustAbsOutputValue(s string) addrs.AbsOutputValue {
+	p, diags := addrs.ParseAbsOutputValueStr(s)
+	if diags.HasErrors() {
+		panic(diags.Err())
+	}
+	return p
+}
+
 func mustProviderConfig(s string) addrs.AbsProviderConfig {
 	p, diags := addrs.ParseAbsProviderConfigStr(s)
 	if diags.HasErrors() {
@@ -263,7 +272,7 @@ type HookRecordApplyOrder struct {
 	l sync.Mutex
 }
 
-func (h *HookRecordApplyOrder) PreApply(addr addrs.AbsResourceInstance, dk addrs.DeposedKey, action plans.Action, priorState, plannedNewState cty.Value) (HookAction, error) {
+func (h *HookRecordApplyOrder) PreApply(id HookResourceIdentity, dk addrs.DeposedKey, action plans.Action, priorState, plannedNewState cty.Value) (HookAction, error) {
 	if plannedNewState.RawEquals(priorState) {
 		return HookActionContinue, nil
 	}
@@ -272,7 +281,7 @@ func (h *HookRecordApplyOrder) PreApply(addr addrs.AbsResourceInstance, dk addrs
 		h.l.Lock()
 		defer h.l.Unlock()
 
-		h.IDs = append(h.IDs, addr.String())
+		h.IDs = append(h.IDs, id.Addr.String())
 		h.Diffs = append(h.Diffs, &plans.Change{
 			Action: action,
 			Before: priorState,
@@ -646,13 +655,6 @@ module.child:
 
     Dependencies:
       aws_instance.foo
-`
-
-const testTerraformApplyOutputOrphanStr = `
-<no state>
-Outputs:
-
-foo = bar
 `
 
 const testTerraformApplyOutputOrphanModuleStr = `

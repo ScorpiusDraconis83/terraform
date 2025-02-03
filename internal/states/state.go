@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/getproviders/providerreqs"
 )
 
 // State is the top-level type of a Terraform state.
@@ -170,6 +171,14 @@ func (s *State) HasManagedResourceInstanceObjects() bool {
 		}
 	}
 	return false
+}
+
+// HasRootOutputValues returns true if there's at least one root output value in the receiving state.
+func (s *State) HasRootOutputValues() bool {
+	if s == nil {
+		return false
+	}
+	return len(s.RootOutputValues) > 0
 }
 
 // Resource returns the state for the resource with the given address, or nil
@@ -363,9 +372,9 @@ func (s *State) ProviderAddrs() []addrs.AbsProviderConfig {
 // the requirements returned by this method will always be unconstrained.
 // The result should usually be merged with a Requirements derived from the
 // current configuration in order to apply some constraints.
-func (s *State) ProviderRequirements() getproviders.Requirements {
+func (s *State) ProviderRequirements() providerreqs.Requirements {
 	configAddrs := s.ProviderAddrs()
-	ret := make(getproviders.Requirements, len(configAddrs))
+	ret := make(providerreqs.Requirements, len(configAddrs))
 	for _, configAddr := range configAddrs {
 		ret[configAddr.Provider] = nil // unconstrained dependency
 	}

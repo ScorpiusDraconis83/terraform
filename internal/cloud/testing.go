@@ -25,7 +25,6 @@ import (
 	"github.com/mitchellh/colorstring"
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/httpclient"
@@ -36,6 +35,7 @@ import (
 	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
 
+	"github.com/hashicorp/terraform/internal/backend/backendrun"
 	backendLocal "github.com/hashicorp/terraform/internal/backend/local"
 )
 
@@ -53,7 +53,7 @@ var (
 		"/api/v2/ping": func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("TFP-API-Version", "2.5")
-			w.Header().Set("TFP-AppName", "Terraform Cloud")
+			w.Header().Set("TFP-AppName", "HCP Terraform")
 		},
 	}
 )
@@ -113,6 +113,24 @@ func testBackendWithTags(t *testing.T) (*Cloud, func()) {
 					cty.StringVal("billing"),
 				},
 			),
+			"project": cty.NullVal(cty.String),
+		}),
+	})
+	b, _, c := testBackend(t, obj, nil)
+	return b, c
+}
+
+func testBackendWithKVTags(t *testing.T) (*Cloud, func()) {
+	obj := cty.ObjectVal(map[string]cty.Value{
+		"hostname":     cty.NullVal(cty.String),
+		"organization": cty.StringVal("hashicorp"),
+		"token":        cty.NullVal(cty.String),
+		"workspaces": cty.ObjectVal(map[string]cty.Value{
+			"name": cty.NullVal(cty.String),
+			"tags": cty.MapVal(map[string]cty.Value{
+				"dept":       cty.StringVal("billing"),
+				"costcenter": cty.StringVal("101"),
+			}),
 			"project": cty.NullVal(cty.String),
 		}),
 	})
@@ -283,7 +301,7 @@ func testBackend(t *testing.T, obj cty.Value, handlers map[string]func(http.Resp
 
 	// Create the organization.
 	_, err = b.client.Organizations.Create(ctx, tfe.OrganizationCreateOptions{
-		Name: tfe.String(b.organization),
+		Name: tfe.String(b.Organization),
 	})
 	if err != nil {
 		t.Fatalf("error: %v", err)
@@ -291,7 +309,7 @@ func testBackend(t *testing.T, obj cty.Value, handlers map[string]func(http.Resp
 
 	// Create the default workspace if required.
 	if b.WorkspaceMapping.Name != "" {
-		_, err = b.client.Workspaces.Create(ctx, b.organization, tfe.WorkspaceCreateOptions{
+		_, err = b.client.Workspaces.Create(ctx, b.Organization, tfe.WorkspaceCreateOptions{
 			Name: tfe.String(b.WorkspaceMapping.Name),
 		})
 		if err != nil {
@@ -353,7 +371,7 @@ func testUnconfiguredBackend(t *testing.T) (*Cloud, func()) {
 	return b, s.Close
 }
 
-func testLocalBackend(t *testing.T, cloud *Cloud) backend.Enhanced {
+func testLocalBackend(t *testing.T, cloud *Cloud) backendrun.OperationsBackend {
 	b := backendLocal.NewWithBackend(cloud)
 
 	// Add a test provider to the local backend.
@@ -600,8 +618,8 @@ func (v *unparsedVariableValue) ParseVariableValue(mode configs.VariableParsingM
 }
 
 // testVariable returns a backend.UnparsedVariableValue used for testing.
-func testVariables(s terraform.ValueSourceType, vs ...string) map[string]backend.UnparsedVariableValue {
-	vars := make(map[string]backend.UnparsedVariableValue, len(vs))
+func testVariables(s terraform.ValueSourceType, vs ...string) map[string]backendrun.UnparsedVariableValue {
+	vars := make(map[string]backendrun.UnparsedVariableValue, len(vs))
 	for _, v := range vs {
 		vars[v] = &unparsedVariableValue{
 			value:  v,

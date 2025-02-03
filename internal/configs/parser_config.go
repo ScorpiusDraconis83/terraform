@@ -53,13 +53,13 @@ func (p *Parser) LoadTestFile(path string) (*TestFile, hcl.Diagnostics) {
 //
 // It references the same LoadHCLFile as LoadConfigFile, so inherits the same
 // syntax selection behaviours.
-func (p *Parser) LoadMockDataFile(path string) (*MockData, hcl.Diagnostics) {
+func (p *Parser) LoadMockDataFile(path string, useForPlanDefault bool) (*MockData, hcl.Diagnostics) {
 	body, diags := p.LoadHCLFile(path)
 	if body == nil {
 		return nil, diags
 	}
 
-	data, dataDiags := decodeMockDataBody(body, MockDataFileOverrideSource)
+	data, dataDiags := decodeMockDataBody(body, useForPlanDefault, MockDataFileOverrideSource)
 	diags = append(diags, dataDiags...)
 	return data, diags
 }
@@ -70,6 +70,10 @@ func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnost
 		return nil, diags
 	}
 
+	return parseConfigFile(body, diags, override, p.allowExperiments)
+}
+
+func parseConfigFile(body hcl.Body, diags hcl.Diagnostics, override, allowExperiments bool) (*File, hcl.Diagnostics) {
 	file := &File{}
 
 	var reqDiags hcl.Diagnostics
@@ -79,7 +83,7 @@ func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnost
 	// We'll load the experiments first because other decoding logic in the
 	// loop below might depend on these experiments.
 	var expDiags hcl.Diagnostics
-	file.ActiveExperiments, expDiags = sniffActiveExperiments(body, p.allowExperiments)
+	file.ActiveExperiments, expDiags = sniffActiveExperiments(body, allowExperiments)
 	diags = append(diags, expDiags...)
 
 	content, contentDiags := body.Content(configFileSchema)
@@ -116,7 +120,9 @@ func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnost
 				case "required_providers":
 					reqs, reqsDiags := decodeRequiredProvidersBlock(innerBlock)
 					diags = append(diags, reqsDiags...)
-					file.RequiredProviders = append(file.RequiredProviders, reqs)
+					if reqs != nil {
+						file.RequiredProviders = append(file.RequiredProviders, reqs)
+					}
 
 				case "provider_meta":
 					providerCfg, cfgDiags := decodeProviderMetaBlock(innerBlock)
@@ -143,7 +149,7 @@ func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnost
 			})
 
 		case "provider":
-			cfg, cfgDiags := decodeProviderBlock(block)
+			cfg, cfgDiags := decodeProviderBlock(block, false)
 			diags = append(diags, cfgDiags...)
 			if cfg != nil {
 				file.ProviderConfigs = append(file.ProviderConfigs, cfg)
@@ -187,6 +193,13 @@ func (p *Parser) loadConfigFile(path string, override bool) (*File, hcl.Diagnost
 			diags = append(diags, cfgDiags...)
 			if cfg != nil {
 				file.DataResources = append(file.DataResources, cfg)
+			}
+
+		case "ephemeral":
+			cfg, cfgDiags := decodeEphemeralBlock(block, override)
+			diags = append(diags, cfgDiags...)
+			if cfg != nil {
+				file.EphemeralResources = append(file.EphemeralResources, cfg)
 			}
 
 		case "moved":
@@ -302,6 +315,10 @@ var configFileSchema = &hcl.BodySchema{
 		},
 		{
 			Type:       "data",
+			LabelNames: []string{"type", "name"},
+		},
+		{
+			Type:       "ephemeral",
 			LabelNames: []string{"type", "name"},
 		},
 		{

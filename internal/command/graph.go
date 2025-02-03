@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/backend"
+	"github.com/hashicorp/terraform/internal/backend/backendrun"
 	"github.com/hashicorp/terraform/internal/command/arguments"
 	"github.com/hashicorp/terraform/internal/dag"
 	"github.com/hashicorp/terraform/internal/plans"
@@ -86,7 +86,7 @@ func (c *GraphCommand) Run(args []string) int {
 	}
 
 	// We require a local backend
-	local, ok := b.(backend.Local)
+	local, ok := b.(backendrun.Local)
 	if !ok {
 		c.showDiagnostics(diags) // in case of any warnings in here
 		c.Ui.Error(ErrUnsupportedLocalOp)
@@ -115,6 +115,7 @@ func (c *GraphCommand) Run(args []string) int {
 		c.showDiagnostics(diags)
 		return 1
 	}
+	lr.Core.SetGraphOpts(&terraform.ContextGraphOpts{SkipGraphValidation: drawCycles})
 
 	if graphTypeStr == "" {
 		if planFile == nil {
@@ -154,7 +155,7 @@ func (c *GraphCommand) Run(args []string) int {
 		// here, though perhaps one day this should be an error.
 		if lr.Plan == nil {
 			plan = &plans.Plan{
-				Changes:      plans.NewChanges(),
+				Changes:      plans.NewChangesSrc(),
 				UIMode:       plans.NormalMode,
 				PriorState:   lr.InputState,
 				PrevRunState: lr.InputState,

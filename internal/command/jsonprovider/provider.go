@@ -6,6 +6,7 @@ package jsonprovider
 import (
 	"encoding/json"
 
+	"github.com/hashicorp/terraform/internal/command/jsonfunction"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/terraform"
 )
@@ -22,9 +23,11 @@ type Providers struct {
 }
 
 type Provider struct {
-	Provider          *Schema            `json:"provider,omitempty"`
-	ResourceSchemas   map[string]*Schema `json:"resource_schemas,omitempty"`
-	DataSourceSchemas map[string]*Schema `json:"data_source_schemas,omitempty"`
+	Provider                 *Schema                                    `json:"provider,omitempty"`
+	ResourceSchemas          map[string]*Schema                         `json:"resource_schemas,omitempty"`
+	DataSourceSchemas        map[string]*Schema                         `json:"data_source_schemas,omitempty"`
+	EphemeralResourceSchemas map[string]*Schema                         `json:"ephemeral_resource_schemas,omitempty"`
+	Functions                map[string]*jsonfunction.FunctionSignature `json:"functions,omitempty"`
 }
 
 func newProviders() *Providers {
@@ -56,8 +59,10 @@ func Marshal(s *terraform.Schemas) ([]byte, error) {
 
 func marshalProvider(tps providers.ProviderSchema) *Provider {
 	return &Provider{
-		Provider:          marshalSchema(tps.Provider),
-		ResourceSchemas:   marshalSchemas(tps.ResourceTypes),
-		DataSourceSchemas: marshalSchemas(tps.DataSources),
+		Provider:                 marshalSchema(tps.Provider),
+		ResourceSchemas:          marshalSchemas(tps.ResourceTypes),
+		DataSourceSchemas:        marshalSchemas(tps.DataSources),
+		EphemeralResourceSchemas: marshalSchemas(tps.EphemeralResourceTypes),
+		Functions:                jsonfunction.MarshalProviderFunctions(tps.Functions),
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/dag"
+	"github.com/hashicorp/terraform/internal/moduletest/mocking"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -85,6 +86,10 @@ type PlanGraphBuilder struct {
 	// the actual graph.
 	ExternalReferences []*addrs.Reference
 
+	// Overrides provides the set of overrides supplied by the testing
+	// framework.
+	Overrides *mocking.Overrides
+
 	// ImportTargets are the list of resources to import.
 	ImportTargets []*ImportTarget
 
@@ -101,14 +106,19 @@ type PlanGraphBuilder struct {
 	//
 	// If empty, then config will not be generated.
 	GenerateConfigPath string
+
+	// SkipGraphValidation indicates whether the graph builder should skip
+	// validation of the graph.
+	SkipGraphValidation bool
 }
 
 // See GraphBuilder
 func (b *PlanGraphBuilder) Build(path addrs.ModuleInstance) (*Graph, tfdiags.Diagnostics) {
 	log.Printf("[TRACE] building graph for %s", b.Operation)
 	return (&BasicGraphBuilder{
-		Steps: b.Steps(),
-		Name:  "PlanGraphBuilder",
+		Steps:               b.Steps(),
+		Name:                "PlanGraphBuilder",
+		SkipGraphValidation: b.SkipGraphValidation,
 	}).Build(path)
 }
 
@@ -132,9 +142,7 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		&ConfigTransformer{
 			Concrete: b.ConcreteResource,
 			Config:   b.Config,
-
-			// Resources are not added from the config on destroy.
-			skip: b.Operation == walkPlanDestroy,
+			destroy:  b.Operation == walkDestroy || b.Operation == walkPlanDestroy,
 
 			importTargets: b.ImportTargets,
 
@@ -154,11 +162,15 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 			Planning:     true,
 			DestroyApply: false, // always false for planning
 		},
+		&variableValidationTransformer{
+			validateWalk: b.Operation == walkValidate,
+		},
 		&LocalTransformer{Config: b.Config},
 		&OutputTransformer{
 			Config:      b.Config,
 			RefreshOnly: b.skipPlanChanges || b.preDestroyRefresh,
 			Destroying:  b.Operation == walkPlanDestroy,
+			Overrides:   b.Overrides,
 
 			// NOTE: We currently treat anything built with the plan graph
 			// builder as "planning" for our purposes here, because we share
@@ -251,6 +263,9 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		// Detect when create_before_destroy must be forced on for a particular
 		// node due to dependency edges, to avoid graph cycles during apply.
 		&ForcedCBDTransformer{},
+
+		// Close any ephemeral resource instances.
+		&ephemeralResourceCloseTransformer{skip: b.Operation == walkValidate},
 
 		// Close opened plugin connections
 		&CloseProviderTransformer{},

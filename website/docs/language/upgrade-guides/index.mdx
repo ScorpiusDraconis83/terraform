@@ -1,152 +1,72 @@
 ---
-page_title: Upgrading to Terraform v1.6
-description: Upgrading to Terraform v1.6
+page_title: Upgrading to Terraform v1.10
+description: Upgrading to Terraform v1.10
 ---
 
-# Upgrading to Terraform v1.6
+# Upgrading to Terraform v1.10
 
 -> **Tip:** Use the version selector to view the upgrade guides for older Terraform versions.
 
-Terraform v1.6 is a minor release in the stable Terraform v1.0 series.
+Terraform v1.10 is a minor release in the stable Terraform v1.0 series.
 
-Terraform v1.6 honors the
-[Terraform v1.0 Compatibility Promises](https://developer.hashicorp.com/terraform/language/v1-compatibility-promises),
-but there are some behavior changes outside of those promises that may affect a
-small number of users. Specifically, the following updates may require
-additional upgrade steps:
-* [End of experimental period for `terraform test`](#terraform-test)
-* [Deprecated parameters for the  S3 backend](#s3-backend)
+Terraform v1.10 honors the
+[Terraform v1.0 Compatibility Promises](https://developer.hashicorp.com/terraform/language/v1-compatibility-promises).
+There are minor changes that may require additional upgrade steps:
 
-See [the full changelog](https://github.com/hashicorp/terraform/blob/v1.6/CHANGELOG.md)
+- `moved` blocks will now report an error if `from` or `to` points to a resource type conflicting with reserved keywords
+
+See [the full changelog](https://github.com/hashicorp/terraform/blob/v1.10/CHANGELOG.md)
 for more details. If you encounter any problems during upgrading which are not
 covered this guide, please start a new topic in
 [the Terraform community forum](https://discuss.hashicorp.com/c/terraform-core)
 to discuss it.
 
-## Terraform Test
+## Conflicting `moved` block references
 
-The previous experimental `terraform test` command has been deprecated and replaced with a fully supported and finalized `terraform test` command.
+Moved blocks now respect reserved keywords such as `local`, `each`, `self` etc. when parsing resource addresses.
+Configurations that reference resources with type names that match top level blocks and
+keywords from moved blocks will need to prepend the reference identifier with `resource.`.
 
-There are substantial differences between the previous experimental approach and the finalized approach:
+## S3 Backend 
 
-- The builtin test provider, `terraform.io/builtin/test`, has been removed and a dedicated syntax introduced for testing files.
-- A new `.tftest.hcl` file extension has been introduced for testing files, allowing a change into the directory structure and test file layout.
-- Test assertions and conditions execute with extended scope and access to the configuration under test.
+Executing `terraform init -reconfigure` is required after updating to Terraform v1.10. This removes the [deprecated fields](#root-assume-role-attribute-removal) from the internal state file.
 
-The major differences are discussed here, for more information consult the [CLI](/terraform/cli/test) and [Language](/terraform/language/tests) documentation.
+### S3 Native State Locking
 
-### Directory structure
+The S3 backend now supports S3 native state locking as an opt-in, experimental feature.
+An S3 lock can be used alongside a DynamoDB lock, or independently.
+When both locking mechanisms are configured, a lock must be successfully acquired from both locations before subsequent operations will proceed.
 
-Previously, test files would be placed within their own subdirectories underneath the `tests` directory from the configuration directory. The following example contains three test files using the experimental framework:
+To opt-in to S3 native state locking, set `use_lockfile` to `true`.
 
-```
-main.tf
-outputs.tf
-providers.tf
-variables.tf
-tests/
-  defaults/
-    test_defaults.tf
-  maximums/
-    test_maximums.tf
-  minimums/
-    test_minimums.tf
-```
-
-With the new directory structure, tests are defined using the new `.tftest.hcl` file extension and do not need to be embedded within subdirectories. To help with organization, test files can, optionally, be embedded within a test directory. The name for this test directory defaults to `tests`, but can be overridden with the `-test-directory` flag.
-
-The following examples are both valid directory structures for test files in the updated framework:
-
-```
-main.tf
-outputs.tf
-providers.tf
-variables.tf
-defaults.tftest.hcl
-maximums.tftest.hcl
-minimums.tftest.hcl
-```
-
-```
-main.tf
-outputs.tf
-providers.tf
-variables.tf
-tests/
-  defaults.tftest.hcl
-  maximums.tftest.hcl
-  minimums.tftest.hcl
-```
-
-### Test structure and assertions
-
-Previously, a test file would contain a module call and a collection of resources from the builtin `test` provider:
-
-```hcl
-# tests/defaults/test_defaults.tf
-
-terraform{
-  required_providers {
-    test = {
-      source = "terraform.io/builtin/test"
-    }
-  }
-}
-
-module "main" {
-  source = "../.."
-}
-
-resource "test_assertions" "api_url" {
-  component = "api_url"
-
-  equal "scheme" {
-    description = "default scheme is https"
-    got         = module.main.scheme
-    want        = "https"
-  }
-  check "port_number" {
-    description = "default port number is 8080"
-    condition   = can(regex(":8080$", module.main.authority))
-  }
-}
-```
-
-With the new framework each test file is made up of a series of `run` blocks. Each `run` block represents a single `terraform plan` or a `terraform apply` operation executed against the main configuration. Assertions from within these `run` blocks can access outputs, variables, resources, and local values from the main configuration directly.
-
-```hcl
-# tests/defaults.tftest.hcl
-
-run "test_defaults" {
-  assert {
-    condition     = output.scheme == "https"
-    error_message = "default scheme should be https"
-  }
-
-  assert {
-    condition     = can(regex(":8080", output.authority))
-    error_message = "default port number should be 8080"
-  }
-}
-```
-
-The above examples demonstrates the differences in layout, scope and access between the two approaches. In the experimental framework, access is granted as if the configuration was being called like a normal module call. In the released framework, assertions execute as if they are custom conditions defined within the main configuration directly.
-
-The `run` block also applies or plans the main configuration by default, there is no need for the specific module call seen in the experimental framework.
-
-## S3 Backend
-
-In Terraform 1.7.0 the S3 backend will begin phasing out the legacy credential chain evaluation order by defaulting `use_legacy_workflow` to `false` and deprecating the argument.
-This will bring the default behavior of the backend into alignment with the AWS SDKs and CLI.
-The legacy behavior can be preserved by setting this argument to `true`.
-
-```hcl
+```terraform
 terraform {
   backend "s3" {
     # additional configuration omitted for brevity
-    use_legacy_workflow = true
+    use_lockfile = true
   }
 }
 ```
 
-In Terraform 1.8.0 this argument will be removed, and the S3 backend will always use the default AWS SDK for Go credential chain evaluation order.
+With S3 locking enabled, a lock file will be placed in the same location as the state file.
+The lock file will be named identically to the state file, but with a `.tflock` extension.
+**S3 bucket policies and IAM policies attached to the calling principal may need to be adjusted to include permissions for the new lock file.**
+
+In a future minor version of Terraform the experimental label will be removed from the `use_lockfile` attribute and attributes related to DynamoDB based locking will be deprecated.
+
+### Root Assume Role Attribute Removal
+
+Several root level attributes related to IAM role assumption which were previously deprecated have been removed.
+Each removed field has an analogous field inside the [`assume_role` block](https://developer.hashicorp.com/terraform/language/backend/s3#assume-role-configuration) which should be used instead.
+
+
+| Removed | Replacement |
+| --- | --- |
+| `role_arn` | `assume_role.role_arn` |
+| `session_name` | `assume_role.session_name` |
+| `external_id` | `assume_role.external_id` |
+| `assume_role_duration_seconds` | `assume_role.duration` |
+| `assume_role_policy` | `assume_role.policy` |
+| `assume_role_policy_arns` | `assume_role.policy_arn` |
+| `assume_role_tags` | `assume_role.tags` |
+| `assume_role_transitive_tag_keys` | `assume_role.transitive_tag_keys` |

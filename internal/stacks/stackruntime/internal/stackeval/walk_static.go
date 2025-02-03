@@ -52,6 +52,21 @@ func walkStaticObjectsInStackConfig[Output any](
 	}
 
 	// TODO: All of the other static object types
+	for _, obj := range stackConfig.LocalValues(ctx) {
+		visit(ctx, walk, obj)
+	}
+
+	for _, obj := range stackConfig.Providers(ctx) {
+		visit(ctx, walk, obj)
+	}
+
+	for _, obj := range stackConfig.Components(ctx) {
+		visit(ctx, walk, obj)
+	}
+
+	for _, obj := range stackConfig.Removeds(ctx) {
+		visit(ctx, walk, obj)
+	}
 
 	for _, obj := range stackConfig.StackCalls(ctx) {
 		visit(ctx, walk, obj)

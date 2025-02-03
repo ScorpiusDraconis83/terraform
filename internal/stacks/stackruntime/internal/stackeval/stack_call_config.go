@@ -6,16 +6,19 @@ package stackeval
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
+
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/promising"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/tfdiags"
-	"github.com/zclconf/go-cty/cty"
-	"github.com/zclconf/go-cty/cty/convert"
 )
 
 // StackCallConfig represents a "stack" block in a stack configuration,
@@ -114,7 +117,7 @@ func (s *StackCallConfig) validateForEachValueInner(ctx context.Context) (cty.Va
 		return cty.NilVal, diags
 	}
 
-	result, moreDiags := evaluateForEachExpr(ctx, s.config.ForEach, ValidatePhase, s.CallerConfig(ctx))
+	result, moreDiags := evaluateForEachExpr(ctx, s.config.ForEach, ValidatePhase, s.CallerConfig(ctx), "stack")
 	diags = diags.Append(moreDiags)
 	return result.Value, diags
 }
@@ -320,9 +323,33 @@ func (s *StackCallConfig) ResolveExpressionReference(ctx context.Context, ref st
 		repetition.EachKey = cty.UnknownVal(cty.String).RefineNotNull()
 		repetition.EachValue = cty.DynamicVal
 	}
-	return s.main.
+	ret, diags := s.main.
 		mustStackConfig(ctx, s.Addr().Stack).
-		resolveExpressionReference(ctx, ref, instances.RepetitionData{}, nil)
+		resolveExpressionReference(ctx, ref, nil, repetition)
+
+	if _, ok := ret.(*ProviderConfig); ok {
+		// We can't reference other providers from anywhere inside an embedded
+		// stack call - they should define their own providers.
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid reference",
+			Detail:   fmt.Sprintf("The object %s is not in scope at this location.", ref.Target.String()),
+			Subject:  ref.SourceRange.ToHCL().Ptr(),
+		})
+	}
+
+	return ret, diags
+}
+
+// ExternalFunctions implements ExpressionScope.
+func (s *StackCallConfig) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, tfdiags.Diagnostics) {
+	return s.main.ProviderFunctions(ctx, s.main.StackConfig(ctx, s.Addr().Stack))
+}
+
+// PlanTimestamp implements ExpressionScope, providing the timestamp at which
+// the current plan is being run.
+func (s *StackCallConfig) PlanTimestamp() time.Time {
+	return s.main.PlanTimestamp()
 }
 
 func (s *StackCallConfig) checkValid(ctx context.Context, phase EvalPhase) tfdiags.Diagnostics {
@@ -332,6 +359,8 @@ func (s *StackCallConfig) checkValid(ctx context.Context, phase EvalPhase) tfdia
 	_, moreDiags = s.ValidateInputVariableValues(ctx, phase)
 	diags = diags.Append(moreDiags)
 	_, moreDiags = s.ValidateResultValue(ctx, phase)
+	diags = diags.Append(moreDiags)
+	moreDiags = ValidateDependsOn(ctx, s.CallerConfig(ctx), s.config.DependsOn)
 	diags = diags.Append(moreDiags)
 	return diags
 }

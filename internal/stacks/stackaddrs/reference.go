@@ -97,6 +97,27 @@ func ParseReference(traversal hcl.Traversal) (Reference, hcl.Traversal, tfdiags.
 		ret.SourceRange = tfdiags.SourceRangeFromHCL(traversal[0].SourceRange())
 		return ret, traversal[1:], diags
 
+	case "terraform":
+		attrName, rng, remain, diags := parseSingleAttrRef(traversal)
+		if diags.HasErrors() {
+			return ret, nil, diags
+		}
+		ret.SourceRange = tfdiags.SourceRangeFromHCL(rng)
+
+		switch attrName {
+		case "applying":
+			ret.Target = TerraformApplying
+			return ret, remain, diags
+		default:
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Reference to unknown symbol",
+				Detail:   fmt.Sprintf("The object %q has no attribute named %q.", rootName, attrName),
+				Subject:  traversal[1].SourceRange().Ptr(),
+			})
+			return ret, remain, diags
+		}
+
 	case "_test_only_global":
 		name, rng, remain, diags := parseSingleAttrRef(traversal)
 		ret.Target = TestOnlyGlobal{Name: name}
@@ -177,4 +198,34 @@ func parseProviderRef(traversal hcl.Traversal) (ProviderConfigRef, hcl.Range, hc
 		})
 	}
 	return ProviderConfigRef{}, hcl.Range{}, nil, diags
+}
+
+func (r Reference) Absolute(stack StackInstance) AbsReference {
+	return AbsReference{
+		Stack: stack,
+		Ref:   r,
+	}
+}
+
+// AbsReference is an absolute form of [Reference] that is to be resolved
+// in the global scope of a particular stack.
+//
+// It's not meaningful to use this type for references to objects that exist
+// only in a more specific scope, such as each.key, each.value, etc, because
+// those would require additional information about exactly which object
+// they are being resolved in terms of.
+type AbsReference struct {
+	Stack StackInstance
+	Ref   Reference
+}
+
+func (r AbsReference) Target() AbsReferenceable {
+	return AbsReferenceable{
+		Stack: r.Stack,
+		Item:  r.Ref.Target,
+	}
+}
+
+func (r AbsReference) SourceRange() tfdiags.SourceRange {
+	return r.Ref.SourceRange
 }

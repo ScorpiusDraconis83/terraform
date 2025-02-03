@@ -14,12 +14,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	baselogging "github.com/hashicorp/aws-sdk-go-base/v2/logging"
 	"github.com/hashicorp/terraform/internal/backend"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/states/remote"
 	"github.com/hashicorp/terraform/internal/states/statemgr"
+)
+
+const (
+	// defaultWorkspaceKeyPrefix is the default prefix for workspace storage.
+	// The colon is used to reduce the chance of name conflicts with existing objects.
+	defaultWorkspaceKeyPrefix = "env:"
+	// lockFileSuffix defines the suffix for Terraform state lock files.
+	lockFileSuffix = ".tflock"
 )
 
 func (b *Backend) Workspaces() ([]string, error) {
@@ -60,7 +69,11 @@ func (b *Backend) Workspaces() ([]string, error) {
 			if IsA[*s3types.NoSuchBucket](err) {
 				return nil, fmt.Errorf(errS3NoSuchBucket, b.bucketName, err)
 			}
-			return nil, fmt.Errorf("Unable to list objects in S3 bucket %q: %w", b.bucketName, err)
+			if foo, ok := As[smithy.APIError](err); b.workspaceKeyPrefix == defaultWorkspaceKeyPrefix && ok && foo.ErrorCode() == "AccessDenied" {
+				log.Warn("Unable to list non-default workspaces", "err", err.Error())
+				return wss[:1], nil
+			}
+			return nil, fmt.Errorf("Unable to list objects in S3 bucket %q with prefix %q: %w", b.bucketName, prefix, err)
 		}
 
 		for _, obj := range page.Contents {
@@ -152,6 +165,8 @@ func (b *Backend) remoteClient(name string) (*RemoteClient, error) {
 		kmsKeyID:              b.kmsKeyID,
 		ddbTable:              b.ddbTable,
 		skipS3Checksum:        b.skipS3Checksum,
+		lockFilePath:          b.getLockFilePath(name),
+		useLockFile:           b.useLockFile,
 	}
 
 	return client, nil
@@ -264,4 +279,10 @@ func newBucketRegionError(requestRegion, bucketRegion string) bucketRegionError 
 
 func (err bucketRegionError) Error() string {
 	return fmt.Sprintf("requested bucket from %q, actual location %q", err.requestRegion, err.bucketRegion)
+}
+
+// getLockFilePath returns the path to the lock file for the given Terraform state.
+// For `default.tfstate`, the lock file is stored at `default.tfstate.tflock`.
+func (b *Backend) getLockFilePath(name string) string {
+	return b.path(name) + lockFileSuffix
 }
